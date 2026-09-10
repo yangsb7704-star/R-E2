@@ -1,350 +1,391 @@
-import json
-import math
-import re
-import textwrap
-from datetime import datetime
+# virtual_mobility_testbed_streamlit_v3_fixed.py
+# Streamlit 실행: streamlit run virtual_mobility_testbed_streamlit_v3_fixed.py
 
+import json
+import re
+import math
 import streamlit as st
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-# =========================================================
-# 가상환경 모빌리티 테스트베드 Streamlit App
-# - 초기 설계 도움 시스템의 JSON/요약문 붙여넣기 지원
-# - 직접 입력 모드 지원
-# - PASS / WARNING / FAIL 기준 및 근거 표시
-# - 3D 심플 가상 주행 이미지
-# =========================================================
-
 st.set_page_config(
     page_title="가상환경 모빌리티 테스트베드",
-    page_icon="🧪",
     layout="wide",
+    initial_sidebar_state="expanded"
 )
 
 # -----------------------------
-# 기본 스타일
+# 기본 상수/도움 함수
 # -----------------------------
-st.markdown(
-    """
-    <style>
-    .main-title {
-        font-size: 2.25rem;
-        font-weight: 800;
-        margin-bottom: 0.25rem;
-    }
-    .sub-desc {
-        color: #6b7280;
-        font-size: 1.02rem;
-        margin-bottom: 1.2rem;
-    }
-    .small-note {
-        color: #6b7280;
-        font-size: 0.9rem;
-    }
-    .pass-box, .warn-box, .fail-box, .info-box {
-        padding: 0.85rem 1rem;
-        border-radius: 0.75rem;
-        margin: 0.35rem 0;
-        border: 1px solid rgba(255,255,255,0.15);
-    }
-    .pass-box { background: rgba(34, 197, 94, 0.13); border-left: 5px solid #22c55e; }
-    .warn-box { background: rgba(245, 158, 11, 0.15); border-left: 5px solid #f59e0b; }
-    .fail-box { background: rgba(239, 68, 68, 0.15); border-left: 5px solid #ef4444; }
-    .info-box { background: rgba(59, 130, 246, 0.12); border-left: 5px solid #3b82f6; }
-    .criterion {
-        font-size: 0.92rem;
-        color: #6b7280;
-        margin-top: 0.25rem;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+G = 9.81
 
-# -----------------------------
-# 상수 및 프리셋
-# -----------------------------
-ROAD_PROFILES = {
-    "실내 평지": {"crr": 0.018, "mu": 0.75, "rough": 1.00, "desc": "마찰과 요철이 작아 안정적인 주행 환경"},
-    "아스팔트": {"crr": 0.022, "mu": 0.85, "rough": 1.05, "desc": "일반 도로형 주행 환경"},
-    "흙길": {"crr": 0.045, "mu": 0.60, "rough": 1.20, "desc": "구름저항이 증가하고 접지 안정성이 낮아지는 환경"},
-    "자갈길": {"crr": 0.060, "mu": 0.52, "rough": 1.32, "desc": "요철과 진동 때문에 토크와 안정성이 더 필요한 환경"},
-    "험지/경사 복합": {"crr": 0.085, "mu": 0.45, "rough": 1.55, "desc": "등판, 요철, 접지 한계가 동시에 문제가 되는 환경"},
+ROAD_TABLE = {
+    "실내 바닥": {"crr": 0.015, "mu": 0.75, "rough": 1.00, "desc": "마찰이 안정적이고 저항이 낮은 실내 바닥"},
+    "아스팔트": {"crr": 0.020, "mu": 0.80, "rough": 1.02, "desc": "일반 도로 수준의 표준 노면"},
+    "흙길": {"crr": 0.045, "mu": 0.55, "rough": 1.12, "desc": "구름저항과 진동이 증가하는 야외 노면"},
+    "자갈길": {"crr": 0.065, "mu": 0.45, "rough": 1.20, "desc": "토크 요구량과 슬립 가능성이 커지는 노면"},
+    "험지": {"crr": 0.095, "mu": 0.38, "rough": 1.35, "desc": "등판·장애물·슬립 위험이 모두 큰 환경"},
 }
 
-OBSTACLE_LEVELS = {
-    "없음": 1.00,
-    "낮음": 1.10,
-    "중간": 1.25,
-    "높음": 1.45,
+CONTROL_TABLE = {
+    "일반 제어": {"eff_delta": 0.00, "heat_delta": 1.00, "speed_limit": 1.00, "desc": "기본 모터 드라이버 제어"},
+    "효율 우선 전력 제어": {"eff_delta": 0.04, "heat_delta": 0.92, "speed_limit": 0.96, "desc": "배터리 소모를 줄이는 대신 최고 성능을 약간 제한"},
+    "발열 억제 전력 제어": {"eff_delta": 0.02, "heat_delta": 0.78, "speed_limit": 0.88, "desc": "고부하 상황에서 출력을 제한해 열 위험을 낮춤"},
+    "토크 우선 가변 제어": {"eff_delta": 0.01, "heat_delta": 0.95, "speed_limit": 0.93, "desc": "경사·험지에서 토크를 우선 확보하는 제어"},
 }
 
-CONTROL_MODES = {
-    "일반 제어": {"eff_bonus": 0.00, "heat_factor": 1.00, "traction_bonus": 0.00, "desc": "별도 보정 없이 기본 구동 상태로 주행"},
-    "효율 우선 전력 제어": {"eff_bonus": 0.04, "heat_factor": 0.92, "traction_bonus": 0.00, "desc": "전력 손실을 줄여 배터리 지속성을 높이는 제어"},
-    "발열 억제 제어": {"eff_bonus": 0.02, "heat_factor": 0.78, "traction_bonus": 0.00, "desc": "순간 성능보다 모터·드라이버 과열 억제를 우선"},
-    "센서 기반 토크 보정": {"eff_bonus": 0.01, "heat_factor": 0.90, "traction_bonus": 0.08, "desc": "경사·험지에서 미끄러짐을 줄이도록 토크를 보정"},
+PURPOSE_PRESETS = {
+    "일반 플랫폼형": {"mass": 35.0, "target_speed": 1.5, "wheels": 4, "wheel_radius": 0.10, "motor_rpm": 3000, "motor_torque": 0.50, "gear_ratio": 18.0, "battery_wh": 480},
+    "전동 킥보드형": {"mass": 75.0, "target_speed": 5.0, "wheels": 2, "wheel_radius": 0.13, "motor_rpm": 3000, "motor_torque": 1.30, "gear_ratio": 6.0, "battery_wh": 500},
+    "스위피형 실내 청소로봇": {"mass": 75.0, "target_speed": 1.2, "wheels": 2, "wheel_radius": 0.10, "motor_rpm": 3000, "motor_torque": 0.70, "gear_ratio": 22.0, "battery_wh": 900},
+    "카고형 고하중 물류로봇": {"mass": 365.0, "target_speed": 1.2, "wheels": 4, "wheel_radius": 0.12, "motor_rpm": 4000, "motor_torque": 1.40, "gear_ratio": 35.0, "battery_wh": 2400},
+    "초소형 전기차형": {"mass": 562.0, "target_speed": 22.2, "wheels": 4, "wheel_radius": 0.25, "motor_rpm": 3000, "motor_torque": 8.00, "gear_ratio": 5.0, "battery_wh": 8000},
+    "FRC/대회용 로봇": {"mass": 55.0, "target_speed": 2.0, "wheels": 4, "wheel_radius": 0.10, "motor_rpm": 3000, "motor_torque": 0.50, "gear_ratio": 18.0, "battery_wh": 432},
+    "궤도형 험지 탐사 로봇": {"mass": 80.0, "target_speed": 0.7, "wheels": 4, "wheel_radius": 0.12, "motor_rpm": 4000, "motor_torque": 1.40, "gear_ratio": 42.0, "battery_wh": 1200},
 }
 
-DIRECT_PRESETS = {
-    "직접 입력": {},
-    "실내 청소로봇 가상 검증": {
-        "mobility_name": "스위피형 실내 청소로봇",
-        "purpose": "실내 바닥 청소 및 저속 자율 이동",
-        "mass": 75.0,
-        "target_speed": 1.2,
-        "wheels": 2,
-        "wheel_radius": 0.10,
-        "motor_rpm": 3000.0,
-        "motor_torque": 0.50,
-        "gear_ratio": 22.0,
-        "efficiency": 0.85,
-        "battery_wh": 480.0,
-    },
-    "FRC/대회용 로봇 가상 검증": {
-        "mobility_name": "FRC/대회용 로봇",
-        "purpose": "공 수집, 이송, 발사 기능을 가진 경기장 주행 로봇",
-        "mass": 55.0,
-        "target_speed": 2.0,
-        "wheels": 4,
-        "wheel_radius": 0.10,
-        "motor_rpm": 3000.0,
-        "motor_torque": 0.50,
-        "gear_ratio": 16.0,
-        "efficiency": 0.85,
-        "battery_wh": 430.0,
-    },
-    "전동 킥보드형 모빌리티": {
-        "mobility_name": "전동 킥보드형 모빌리티",
-        "purpose": "개인 이동용 저중량 고속 주행",
-        "mass": 85.0,
-        "target_speed": 4.2,
-        "wheels": 2,
-        "wheel_radius": 0.11,
-        "motor_rpm": 3200.0,
-        "motor_torque": 0.80,
-        "gear_ratio": 12.0,
-        "efficiency": 0.86,
-        "battery_wh": 520.0,
-    },
-    "초소형 전기차형 모빌리티": {
-        "mobility_name": "초소형 전기차형 모빌리티",
-        "purpose": "도로형 고속 이동 및 탑승자 운송",
-        "mass": 562.0,
-        "target_speed": 13.9,
-        "wheels": 4,
-        "wheel_radius": 0.25,
-        "motor_rpm": 3000.0,
-        "motor_torque": 8.0,
-        "gear_ratio": 9.0,
-        "efficiency": 0.88,
-        "battery_wh": 6000.0,
-    },
-    "궤도형 험지 탐사 로봇": {
-        "mobility_name": "궤도형 험지 탐사 로봇",
-        "purpose": "험지, 경사, 장애물 환경에서 저속 탐사",
-        "mass": 80.0,
-        "target_speed": 0.7,
-        "wheels": 4,
-        "wheel_radius": 0.12,
-        "motor_rpm": 4000.0,
-        "motor_torque": 1.4,
-        "gear_ratio": 38.0,
-        "efficiency": 0.82,
-        "battery_wh": 800.0,
-    },
+SCALE_MAP = {
+    "학생용": "student", "연구용": "research", "산업용": "industry",
+    "student": "student", "research": "research", "industry": "industry"
 }
 
-# -----------------------------
-# 유틸 함수
-# -----------------------------
-def safe_float(value, default=0.0):
+ENV_MAP = {
+    "단순 이동 / 평지 중심": "실내 바닥",
+    "실내": "실내 바닥",
+    "실내 바닥": "실내 바닥",
+    "평지": "아스팔트",
+    "일반": "아스팔트",
+    "normal": "아스팔트",
+    "indoor": "실내 바닥",
+    "obstacle": "자갈길",
+    "extreme": "험지",
+    "장애물": "자갈길",
+    "험지": "험지",
+    "흙길": "흙길",
+    "자갈길": "자갈길",
+    "아스팔트": "아스팔트",
+}
+
+
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def to_float(text, default=None):
+    if text is None:
+        return default
+    s = str(text).replace(",", "")
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
+    if not m:
+        return default
     try:
-        if value is None:
-            return default
-        if isinstance(value, (int, float)):
-            return float(value)
-        txt = str(value).replace(",", "")
-        nums = re.findall(r"-?\d+(?:\.\d+)?", txt)
-        return float(nums[0]) if nums else default
+        return float(m.group(0))
     except Exception:
         return default
 
 
-def safe_int(value, default=0):
-    try:
-        return int(round(safe_float(value, default)))
-    except Exception:
-        return default
+def normalize_key(s):
+    return re.sub(r"\s+", "", str(s).strip())
 
 
-def line_value(text, keys):
-    for line in text.splitlines():
-        clean = line.strip()
-        for key in keys:
-            if clean.startswith(key):
-                parts = re.split(r"[:：]", clean, maxsplit=1)
-                if len(parts) == 2:
-                    return parts[1].strip()
+def line_value(text, labels):
+    """한국어 요약문에서 '라벨: 값' 형태 추출. 라벨 변형을 폭넓게 허용."""
+    if not text:
+        return None
+    for raw_line in text.splitlines():
+        line = raw_line.strip().lstrip("-•·*").strip()
+        if not line or ":" not in line:
+            continue
+        left, right = line.split(":", 1)
+        left_n = normalize_key(left)
+        for label in labels:
+            if normalize_key(label) == left_n or normalize_key(label) in left_n:
+                return right.strip()
     return None
 
 
-def infer_vehicle_type(name, purpose, extra=""):
-    s = f"{name} {purpose} {extra}".lower()
-    if any(k in s for k in ["킥보드", "scooter"]):
-        return "scooter"
-    if any(k in s for k in ["전기차", "자동차", "ev", "car", "초소형"]):
-        return "car"
-    if any(k in s for k in ["궤도", "트랙", "track", "험지", "탐사"]):
-        return "tracked"
-    if any(k in s for k in ["청소", "스위피", "clean"]):
-        return "cleaner"
-    if any(k in s for k in ["물류", "카고", "cargo"]):
-        return "cargo"
-    if any(k in s for k in ["frc", "대회", "shooter", "intake", "feeder"]):
-        return "competition"
-    return "generic"
+def parse_pasted_design(text):
+    """JSON 또는 초기 설계 도움 시스템의 일반 요약문을 테스트베드 입력값으로 변환."""
+    if not text or not text.strip():
+        raise ValueError("붙여넣기 내용이 비어 있습니다.")
 
+    raw = text.strip()
+    data = {}
 
-def parse_design_text(raw_text):
-    """JSON 또는 일반 요약문을 모두 해석한다."""
-    raw = (raw_text or "").strip()
-    if not raw:
-        raise ValueError("붙여넣은 내용이 비어 있습니다.")
-
-    # 1) JSON 우선 시도
+    # 1) JSON 우선 처리
     if raw.startswith("{") or raw.startswith("["):
-        obj = json.loads(raw)
-        if isinstance(obj, list):
-            obj = obj[0]
-        return normalize_design_data(obj)
+        try:
+            obj = json.loads(raw)
+            # 여러 버전의 키 구조를 최대한 수용
+            src_input = obj.get("input", obj.get("user_input", obj.get("design", obj))) if isinstance(obj, dict) else {}
+            src_result = obj.get("result", obj.get("calc", obj.get("calculation", {}))) if isinstance(obj, dict) else {}
+            src_parts = obj.get("parts", obj.get("part", obj.get("recommended_parts", {}))) if isinstance(obj, dict) else {}
+            src_gear = obj.get("gear", obj.get("gear_recommendation", obj.get("recommendation", {}))) if isinstance(obj, dict) else {}
 
-    # 2) 일반 요약문 파싱
-    purpose = line_value(raw, ["용도", "목적", "모빌리티 용도"])
-    scale = line_value(raw, ["스케일", "규모"])
+            data["purpose"] = src_input.get("purpose") or obj.get("purpose") or "붙여넣은 모빌리티"
+            data["scale"] = src_input.get("scale") or obj.get("scale") or "student"
+            data["mass"] = float(src_input.get("mass", obj.get("mass", 35.0)))
+            speed = src_input.get("targetSpeedMps", src_input.get("speed_mps", src_input.get("speed", obj.get("speed", 1.5))))
+            unit = src_input.get("unit", obj.get("unit", "mps"))
+            speed = float(speed)
+            if unit in ["kmh", "km/h", "㎞/h"]:
+                speed = speed / 3.6
+            data["target_speed"] = speed
+            data["wheels"] = int(float(src_input.get("wheels", obj.get("wheels", 4))))
+            env_raw = src_input.get("env", src_input.get("environment", obj.get("env", obj.get("environment", "실내 바닥"))))
+            data["road"] = ENV_MAP.get(str(env_raw).strip(), str(env_raw).strip() or "실내 바닥")
+            data["extra"] = src_input.get("extra", obj.get("extra", ""))
+
+            data["required_power"] = float(src_result.get("requiredPowerW", src_result.get("req_power", src_result.get("required_power_w", 0.0))) or 0.0)
+            data["required_torque"] = float(src_result.get("requiredWheelTorqueNm", src_result.get("req_tq", src_result.get("required_wheel_torque_nm", 0.0))) or 0.0)
+            data["required_rpm"] = float(src_result.get("requiredWheelRpm", src_result.get("req_rpm", src_result.get("required_wheel_rpm", 0.0))) or 0.0)
+            data["gear_ratio"] = float(src_result.get("recommendedGearRatio", src_gear.get("best_ratio", obj.get("gear_ratio", 18.0))) or 18.0)
+            data["motor_rpm"] = float(src_parts.get("motor_rpm", src_result.get("motorRpm", obj.get("motor_rpm", 3000))) or 3000)
+            data["motor_torque"] = float(src_parts.get("motor_nm", src_result.get("motorTorqueNm", obj.get("motor_torque", 0.5))) or 0.5)
+            data["wheel_radius"] = float(src_parts.get("wheel_r", src_result.get("wheelRadiusM", obj.get("wheel_radius", 0.10))) or 0.10)
+            data["efficiency"] = float(src_result.get("driveEfficiency", obj.get("efficiency", 0.85)) or 0.85)
+            data["source_type"] = "JSON"
+            return fill_missing_by_purpose(data)
+        except Exception:
+            # JSON처럼 보였지만 실패하면 일반 요약문으로 재시도
+            pass
+
+    # 2) 일반 요약문 처리
+    purpose = line_value(raw, ["용도", "목적", "모빌리티 용도", "목표 모빌리티 용도"])
+    scale = line_value(raw, ["스케일", "제작 스케일"])
     mass = line_value(raw, ["질량", "총 질량", "예상 총 질량"])
-    speed = line_value(raw, ["목표 속도", "속도"])
+    speed = line_value(raw, ["목표 속도", "속도", "주행 속도"])
     wheels = line_value(raw, ["구동 바퀴 수", "바퀴 수", "구동바퀴수"])
-    env = line_value(raw, ["운행 환경", "환경"])
-    extra = line_value(raw, ["기타 요구사항", "요구사항", "추가 요구사항"])
+    env = line_value(raw, ["운행 환경", "환경", "주행 환경"])
+    extra = line_value(raw, ["기타 요구사항", "요구사항", "기타"])
 
-    req_power = line_value(raw, ["요구 동력", "필요 동력"])
-    req_tq = line_value(raw, ["바퀴당 요구 토크", "요구 토크"])
-    req_rpm = line_value(raw, ["필요 휠 RPM", "휠 RPM", "필요 RPM"])
-    gear = line_value(raw, ["추천 감속비", "추천 기어비", "감속비", "기어비"])
-    motor_rpm = line_value(raw, ["모터 RPM", "모터 회전수"])
-    motor_torque = line_value(raw, ["모터 토크", "모터 기준 토크", "기준 토크"])
-    wheel_radius = line_value(raw, ["바퀴 반지름", "휠 반지름"])
+    # 물리/추천 결과 라벨도 있으면 추출
+    req_power = line_value(raw, ["요구 동력", "필요 동력", "required power"])
+    req_torque = line_value(raw, ["바퀴당 요구 토크", "요구 토크", "required torque"])
+    req_rpm = line_value(raw, ["필요 휠 RPM", "휠 RPM", "required wheel rpm"])
+    gear_ratio = line_value(raw, ["추천 감속비", "추천 기어비", "감속비", "기어비"])
+    motor_rpm = line_value(raw, ["모터 RPM", "추천 모터 RPM"])
+    motor_torque = line_value(raw, ["모터 토크", "기준 토크", "연속토크"])
+    wheel_radius = line_value(raw, ["바퀴 반지름", "휠 반지름", "wheel radius"])
 
-    # 속도 단위 추론
-    speed_num = safe_float(speed, 1.0)
-    unit = "mps"
-    if speed and ("km/h" in speed.lower() or "kmh" in speed.lower() or "킬로" in speed):
-        unit = "kmh"
-    target_speed = speed_num / 3.6 if unit == "kmh" else speed_num
+    if not any([purpose, mass, speed, wheels, env, extra, req_power, req_torque, req_rpm]):
+        raise ValueError("요약문에서 인식 가능한 항목을 찾지 못했습니다. '용도:', '질량:', '목표 속도:', '구동 바퀴 수:' 같은 라벨이 필요합니다.")
 
-    env_map = {
-        "indoor": "실내 평지",
-        "normal": "아스팔트",
-        "obstacle": "자갈길",
-        "extreme": "험지/경사 복합",
-        "단순 이동": "실내 평지",
-        "평지": "실내 평지",
-        "실내": "실내 평지",
-        "장애물": "자갈길",
-        "험지": "험지/경사 복합",
+    data["purpose"] = purpose or "붙여넣은 모빌리티"
+    data["scale"] = SCALE_MAP.get(str(scale).strip(), str(scale or "student"))
+    data["mass"] = to_float(mass, 35.0)
+
+    speed_value = to_float(speed, 1.5)
+    speed_text = str(speed or "")
+    if re.search(r"km\s*/?\s*h|㎞|kmh", speed_text, re.I):
+        speed_value = speed_value / 3.6
+    data["target_speed"] = speed_value
+    data["wheels"] = int(to_float(wheels, 4))
+    data["road"] = ENV_MAP.get(str(env).strip(), "실내 바닥")
+    data["extra"] = extra or ""
+    data["required_power"] = to_float(req_power, 0.0) or 0.0
+    data["required_torque"] = to_float(req_torque, 0.0) or 0.0
+    data["required_rpm"] = to_float(req_rpm, 0.0) or 0.0
+    data["gear_ratio"] = to_float(gear_ratio, None)
+    data["motor_rpm"] = to_float(motor_rpm, None)
+    data["motor_torque"] = to_float(motor_torque, None)
+    data["wheel_radius"] = to_float(wheel_radius, None)
+    data["efficiency"] = 0.85
+    data["source_type"] = "요약문"
+    return fill_missing_by_purpose(data)
+
+
+def fill_missing_by_purpose(data):
+    """붙여넣기에서 빠진 모터/바퀴/기어 값을 용도 기반 기본값으로 보완."""
+    purpose = str(data.get("purpose", ""))
+    preset_name = "일반 플랫폼형"
+    for key in PURPOSE_PRESETS:
+        if key != "일반 플랫폼형" and (key in purpose or purpose in key):
+            preset_name = key
+            break
+    if "킥보드" in purpose or "스쿠터" in purpose:
+        preset_name = "전동 킥보드형"
+    elif "청소" in purpose or "스위피" in purpose:
+        preset_name = "스위피형 실내 청소로봇"
+    elif "물류" in purpose or "카고" in purpose:
+        preset_name = "카고형 고하중 물류로봇"
+    elif "전기차" in purpose or "자동차" in purpose or "EV" in purpose.upper():
+        preset_name = "초소형 전기차형"
+    elif "FRC" in purpose.upper() or "대회" in purpose:
+        preset_name = "FRC/대회용 로봇"
+    elif "궤도" in purpose or "탐사" in purpose or "험지" in purpose:
+        preset_name = "궤도형 험지 탐사 로봇"
+
+    p = PURPOSE_PRESETS[preset_name]
+    for k, v in p.items():
+        if data.get(k) is None or data.get(k) == "":
+            data[k] = v
+    # 이상치 보정
+    data["mass"] = max(float(data.get("mass", p["mass"])), 0.1)
+    data["target_speed"] = max(float(data.get("target_speed", p["target_speed"])), 0.01)
+    data["wheels"] = max(int(float(data.get("wheels", p["wheels"]))), 1)
+    data["wheel_radius"] = max(float(data.get("wheel_radius", p["wheel_radius"])), 0.02)
+    data["motor_rpm"] = max(float(data.get("motor_rpm", p["motor_rpm"])), 100.0)
+    data["motor_torque"] = max(float(data.get("motor_torque", p["motor_torque"])), 0.01)
+    data["gear_ratio"] = max(float(data.get("gear_ratio", p["gear_ratio"])), 1.0)
+    data["battery_wh"] = max(float(data.get("battery_wh", p.get("battery_wh", 500))), 10.0)
+    data["efficiency"] = clamp(float(data.get("efficiency", 0.85)), 0.3, 0.98)
+    data["preset_hint"] = preset_name
+    if data.get("road") not in ROAD_TABLE:
+        data["road"] = ENV_MAP.get(str(data.get("road", "")).strip(), "실내 바닥")
+    return data
+
+
+def clear_paste_text():
+    st.session_state["paste_text"] = ""
+    st.session_state.pop("parsed_data", None)
+    st.session_state.pop("parse_message", None)
+
+
+def apply_parsed_to_session(d):
+    keys = ["purpose", "mass", "target_speed", "wheels", "wheel_radius", "motor_rpm", "motor_torque", "gear_ratio", "battery_wh", "efficiency", "road", "extra"]
+    for k in keys:
+        st.session_state[f"mob_{k}"] = d.get(k)
+    st.session_state["parsed_data"] = d
+    st.session_state["parse_message"] = f"{d.get('source_type', '데이터')} 형식으로 설계 데이터를 적용했습니다. 부족한 값은 '{d.get('preset_hint', '일반 플랫폼형')}' 기본값으로 보완했습니다."
+
+
+# -----------------------------
+# 시뮬레이션 계산
+# -----------------------------
+def simulate(spec, env):
+    mass = spec["mass"] + env["payload"]
+    v_target = spec["target_speed"]
+    wheel_r = spec["wheel_radius"]
+    wheels = max(int(spec["wheels"]), 1)
+    motor_rpm = spec["motor_rpm"]
+    motor_torque = spec["motor_torque"]
+    ratio = spec["gear_ratio"]
+    eff = spec["efficiency"] + CONTROL_TABLE[env["control"]]["eff_delta"]
+    eff = clamp(eff, 0.3, 0.96)
+    battery_wh = spec["battery_wh"]
+    road = ROAD_TABLE[env["road"]]
+    control = CONTROL_TABLE[env["control"]]
+    angle = math.radians(env["slope_deg"])
+
+    crr = road["crr"] * road["rough"]
+    mu = road["mu"]
+    obstacle_factor = {"없음": 1.0, "낮음": 1.08, "중간": 1.18, "높음": 1.35}[env["obstacle"]]
+
+    wheel_torque_total = motor_torque * ratio * eff * wheels
+    traction_force = wheel_torque_total / max(wheel_r, 0.001)
+    traction_limit = mu * mass * G * math.cos(angle)
+    usable_force = min(traction_force, traction_limit)
+
+    rolling_force = crr * mass * G * math.cos(angle) * obstacle_factor
+    grade_force = mass * G * math.sin(angle)
+    aero_force_at_target = 0.5 * 1.225 * 0.75 * 0.8 * (v_target ** 2) if env["air_drag"] else 0.0
+    required_force = rolling_force + grade_force + aero_force_at_target
+    required_wheel_torque_total = required_force * wheel_r
+    required_torque_per_wheel = required_wheel_torque_total / wheels
+
+    net_force = usable_force - required_force
+    acceleration = net_force / mass
+
+    wheel_rpm_max = motor_rpm / ratio
+    max_speed_by_rpm = (2 * math.pi * wheel_r) * wheel_rpm_max / 60.0 * control["speed_limit"]
+
+    # 실제 최고속도는 RPM 한계와 힘 균형을 모두 고려하되 단순 모델로 제한
+    if net_force <= 0:
+        predicted_max_speed = max(0.0, min(max_speed_by_rpm, v_target * max(0.05, usable_force / max(required_force, 1e-6))))
+        accel_time = float("inf")
+    else:
+        predicted_max_speed = max_speed_by_rpm
+        accel_time = v_target / max(acceleration, 0.05)
+
+    speed_achievement = predicted_max_speed / max(v_target, 0.01) * 100
+    torque_margin = (wheel_torque_total - required_wheel_torque_total) / max(required_wheel_torque_total, 1e-6) * 100
+    traction_margin = (traction_limit - traction_force) / max(traction_force, 1e-6) * 100
+
+    mech_power = required_force * min(v_target, predicted_max_speed)
+    electric_power = mech_power / max(eff, 0.1)
+    # 가속/장애물 보정
+    avg_power = electric_power * (1.15 + (obstacle_factor - 1) * 0.5)
+    runtime_h = battery_wh / max(avg_power, 1.0)
+    range_km = runtime_h * min(v_target, predicted_max_speed) * 3.6
+    course_time_s = env["course_m"] / max(min(v_target, predicted_max_speed), 0.05)
+    course_energy_wh = avg_power * (course_time_s / 3600.0)
+    battery_after = clamp(100 - course_energy_wh / battery_wh * 100, 0, 100)
+
+    # 열 위험: 모터 가용 출력 추정 = 토크*각속도*wheels
+    motor_total_power = motor_torque * (motor_rpm * 2 * math.pi / 60) * wheels
+    load_ratio = avg_power / max(motor_total_power, 1.0)
+    heat_index = load_ratio * 100 * control["heat_delta"]
+
+    # 제동 거리
+    decel = clamp(mu * G * 0.65, 0.8, 7.0)
+    braking_distance = (min(v_target, predicted_max_speed) ** 2) / (2 * decel)
+
+    # 최대 등판각 근사
+    available_for_grade = max(usable_force - crr * mass * G, 0.0)
+    max_slope_rad = math.asin(clamp(available_for_grade / max(mass * G, 1e-6), 0, 0.95))
+    max_slope_deg = math.degrees(max_slope_rad)
+
+    # 시간 데이터
+    total_time = min(max(course_time_s + 6, 20), 120)
+    steps = 80
+    t_list, v_list, x_list, b_list, torque_use_list = [], [], [], [], []
+    x = 0.0
+    for i in range(steps + 1):
+        t = total_time * i / steps
+        if math.isfinite(accel_time) and accel_time > 0:
+            v = min(predicted_max_speed, v_target, (v_target / accel_time) * t)
+        else:
+            v = min(predicted_max_speed, v_target) * (1 - math.exp(-t / 8))
+        if i > 0:
+            dt = total_time / steps
+            x += v * dt
+        energy_wh = avg_power * (t / 3600.0)
+        batt = clamp(100 - energy_wh / battery_wh * 100, 0, 100)
+        torque_use = clamp(required_wheel_torque_total / max(wheel_torque_total, 1e-6) * 100, 0, 180)
+        t_list.append(t); v_list.append(v); x_list.append(x); b_list.append(batt); torque_use_list.append(torque_use)
+
+    result = {
+        "mass_total": mass,
+        "wheel_torque_total": wheel_torque_total,
+        "required_wheel_torque_total": required_wheel_torque_total,
+        "required_torque_per_wheel": required_torque_per_wheel,
+        "traction_force": traction_force,
+        "traction_limit": traction_limit,
+        "usable_force": usable_force,
+        "required_force": required_force,
+        "rolling_force": rolling_force,
+        "grade_force": grade_force,
+        "aero_force": aero_force_at_target,
+        "net_force": net_force,
+        "acceleration": acceleration,
+        "predicted_max_speed": predicted_max_speed,
+        "speed_achievement": speed_achievement,
+        "accel_time": accel_time,
+        "torque_margin": torque_margin,
+        "traction_margin": traction_margin,
+        "avg_power": avg_power,
+        "runtime_h": runtime_h,
+        "range_km": range_km,
+        "course_time_s": course_time_s,
+        "course_energy_wh": course_energy_wh,
+        "battery_after": battery_after,
+        "heat_index": heat_index,
+        "braking_distance": braking_distance,
+        "max_slope_deg": max_slope_deg,
+        "time": t_list,
+        "speed_series": v_list,
+        "distance_series": x_list,
+        "battery_series": b_list,
+        "torque_use_series": torque_use_list,
     }
-    road = "실내 평지"
-    if env:
-        for k, v in env_map.items():
-            if k in env:
-                road = v
-                break
-
-    design = {
-        "mobility_name": purpose or "불러온 모빌리티",
-        "purpose": purpose or "초기 설계 도움 시스템에서 불러온 모빌리티",
-        "scale": scale or "문서에 명시되지 않음",
-        "mass": safe_float(mass, 35.0),
-        "target_speed": target_speed,
-        "wheels": max(1, safe_int(wheels, 4)),
-        "road": road,
-        "extra": extra or "",
-        "wheel_radius": safe_float(wheel_radius, 0.10),
-        "motor_rpm": safe_float(motor_rpm, 3000.0),
-        "motor_torque": safe_float(motor_torque, 0.50),
-        "gear_ratio": safe_float(gear, 18.0),
-        "efficiency": 0.85,
-        "battery_wh": 500.0,
-        "required_power_w_from_design": safe_float(req_power, 0.0),
-        "required_wheel_torque_nm_from_design": safe_float(req_tq, 0.0),
-        "required_wheel_rpm_from_design": safe_float(req_rpm, 0.0),
-        "source_type": "text_summary",
-    }
-    design["vehicle_type"] = infer_vehicle_type(design["mobility_name"], design["purpose"], design["extra"])
-    return design
+    result["judgements"] = make_judgements(result, spec, env)
+    result["score"] = calc_score(result["judgements"])
+    return result
 
 
-def normalize_design_data(obj):
-    """초기 설계 시스템 JSON 구조가 조금 달라도 테스트베드 공통 구조로 변환한다."""
-    input_data = obj.get("input", obj.get("data", obj)) if isinstance(obj, dict) else {}
-    result = obj.get("result", obj.get("calc", obj.get("analysis", {}))) if isinstance(obj, dict) else {}
-    parts = obj.get("parts", obj.get("part", {})) if isinstance(obj, dict) else {}
-
-    purpose = input_data.get("purpose") or obj.get("purpose") or "불러온 모빌리티"
-    scale = input_data.get("scale") or obj.get("scale") or "문서에 명시되지 않음"
-
-    speed = input_data.get("targetSpeedMps", input_data.get("speed_mps", input_data.get("speed", 1.0)))
-    unit = input_data.get("unit", "mps")
-    target_speed = safe_float(speed, 1.0)
-    if unit in ["kmh", "km/h"]:
-        target_speed = target_speed / 3.6
-
-    env = input_data.get("env", input_data.get("environment", "indoor"))
-    road = "실내 평지"
-    if str(env).lower() in ["normal", "road", "asphalt"]:
-        road = "아스팔트"
-    elif str(env).lower() in ["obstacle"]:
-        road = "자갈길"
-    elif str(env).lower() in ["extreme"]:
-        road = "험지/경사 복합"
-
-    gear_ratio = (
-        result.get("recommendedGearRatio")
-        or result.get("best_ratio")
-        or result.get("recommended_ratio")
-        or result.get("gear_ratio")
-        or obj.get("best_ratio")
-        or 18.0
-    )
-
-    design = {
-        "mobility_name": purpose,
-        "purpose": purpose,
-        "scale": scale,
-        "mass": safe_float(input_data.get("mass", obj.get("mass", 35.0)), 35.0),
-        "target_speed": target_speed,
-        "wheels": max(1, safe_int(input_data.get("wheels", obj.get("wheels", 4)), 4)),
-        "road": road,
-        "extra": input_data.get("extra", obj.get("extra", "")),
-        "wheel_radius": safe_float(parts.get("wheel_r", result.get("wheelRadiusM", result.get("wheel_radius", 0.10))), 0.10),
-        "motor_rpm": safe_float(parts.get("motor_rpm", result.get("motorRpm", result.get("motor_rpm", 3000.0))), 3000.0),
-        "motor_torque": safe_float(parts.get("motor_nm", result.get("motorTorqueNm", result.get("motor_nm", 0.50))), 0.50),
-        "gear_ratio": safe_float(gear_ratio, 18.0),
-        "efficiency": safe_float(result.get("driveEfficiency", result.get("efficiency", 0.85)), 0.85),
-        "battery_wh": safe_float(result.get("batteryWh", result.get("battery_wh", 500.0)), 500.0),
-        "required_power_w_from_design": safe_float(result.get("requiredPowerW", result.get("req_power", 0.0)), 0.0),
-        "required_wheel_torque_nm_from_design": safe_float(result.get("requiredWheelTorqueNm", result.get("req_tq", 0.0)), 0.0),
-        "required_wheel_rpm_from_design": safe_float(result.get("requiredWheelRpm", result.get("req_rpm", 0.0)), 0.0),
-        "source_type": "json",
-    }
-    design["vehicle_type"] = infer_vehicle_type(design["mobility_name"], design["purpose"], design["extra"])
-    return design
-
-
-def evaluate_status(value, pass_cond, warn_cond):
+def judge_status(value, pass_cond, warn_cond):
     if pass_cond(value):
         return "PASS"
     if warn_cond(value):
@@ -352,837 +393,494 @@ def evaluate_status(value, pass_cond, warn_cond):
     return "FAIL"
 
 
-def status_box(status, title, value_text, criterion, evidence):
-    cls = "pass-box" if status == "PASS" else "warn-box" if status == "WARNING" else "fail-box"
-    icon = "✅" if status == "PASS" else "⚠️" if status == "WARNING" else "❌"
-    st.markdown(
-        f"""
-        <div class="{cls}">
-            <b>{icon} {title}: {status}</b><br>
-            <b>결과값:</b> {value_text}<br>
-            <div class="criterion"><b>판정 기준:</b> {criterion}</div>
-            <div class="criterion"><b>판정 근거:</b> {evidence}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+def make_judgements(r, spec, env):
+    j = []
+    # 목표 속도
+    status = judge_status(r["speed_achievement"], lambda x: x >= 95, lambda x: x >= 75)
+    j.append({
+        "항목": "목표 속도",
+        "판정": status,
+        "결과값": f"{r['speed_achievement']:.1f}% 달성 / 최고 {r['predicted_max_speed']:.2f} m/s",
+        "판정 기준": "PASS ≥ 95%, WARNING 75~95%, FAIL < 75%",
+        "근거": "모터 RPM, 기어비, 바퀴 반지름으로 계산한 최고속도를 목표 속도와 비교",
+        "주 원인": "기어비가 너무 크거나 모터 RPM/출력이 부족해 바퀴 회전수가 목표 속도에 미치지 못함",
+        "해결방안": "감속비를 낮추거나 모터 RPM을 높이고, 목표 속도에 맞는 바퀴 반지름을 재검토"
+    })
+    # 토크
+    status = judge_status(r["torque_margin"], lambda x: x >= 30, lambda x: x >= 0)
+    j.append({
+        "항목": "구동 토크",
+        "판정": status,
+        "결과값": f"토크 여유율 {r['torque_margin']:.1f}%",
+        "판정 기준": "PASS ≥ 30%, WARNING 0~30%, FAIL < 0%",
+        "근거": "모터 토크×감속비×효율×구동 바퀴 수와 노면/경사에서 필요한 바퀴 토크 비교",
+        "주 원인": "질량, 경사각, 노면저항, 장애물 수준에 비해 모터 토크 또는 감속비가 부족함",
+        "해결방안": "감속비 증가, 고토크 모터 적용, 질량 감소, 바퀴 반지름 축소, 구동 바퀴 수 증가 검토"
+    })
+    # 등판
+    slope_margin = r["max_slope_deg"] - env["slope_deg"]
+    status = judge_status(slope_margin, lambda x: x >= 5, lambda x: x >= 0)
+    j.append({
+        "항목": "등판 성능",
+        "판정": status,
+        "결과값": f"최대 등판각 {r['max_slope_deg']:.1f}° / 설정 {env['slope_deg']:.1f}°",
+        "판정 기준": "PASS: 설정 경사보다 5° 이상 여유, WARNING: 통과 가능하지만 여유 부족, FAIL: 통과 불가",
+        "근거": "사용 가능한 견인력에서 구름저항을 제외한 힘으로 극복 가능한 경사각 추정",
+        "주 원인": "경사로 인한 중력 저항이 증가해 가용 견인력이 부족함",
+        "해결방안": "경사 주행용 토크 우선 기어비 적용, 감속비 증가, 접지력 높은 바퀴/트랙 사용"
+    })
+    # 배터리
+    target_min = env["target_runtime_min"]
+    runtime_min = r["runtime_h"] * 60
+    ratio = runtime_min / max(target_min, 0.1) * 100
+    status = judge_status(ratio, lambda x: x >= 100, lambda x: x >= 70)
+    j.append({
+        "항목": "배터리 지속성",
+        "판정": status,
+        "결과값": f"예상 {runtime_min:.1f}분 / 목표 {target_min:.1f}분",
+        "판정 기준": "PASS ≥ 목표시간 100%, WARNING 70~100%, FAIL < 70%",
+        "근거": "평균 소비전력과 배터리 Wh를 이용해 연속 주행 가능 시간 계산",
+        "주 원인": "배터리 용량 대비 평균 소비전력이 큼",
+        "해결방안": "배터리 Wh 증가, 질량 감소, 효율 높은 모터/감속기 사용, 속도 또는 코스 난이도 조정"
+    })
+    # 발열
+    heat = r["heat_index"]
+    status = "PASS" if heat < 60 else ("WARNING" if heat < 100 else "FAIL")
+    j.append({
+        "항목": "발열 위험",
+        "판정": status,
+        "결과값": f"발열 지수 {heat:.1f}",
+        "판정 기준": "PASS < 60, WARNING 60~100, FAIL ≥ 100",
+        "근거": "평균 소비전력을 모터 추정 가용출력과 비교하고 제어 방식의 발열 억제 효과 반영",
+        "주 원인": "모터 정격에 비해 요구 출력이 높거나 고부하 주행 시간이 길음",
+        "해결방안": "상위 출력 모터/드라이버 사용, 방열 구조 추가, 발열 억제 제어 선택, 감속비 재조정"
+    })
+    # 제동
+    safe_dist = max(1.0, spec["target_speed"] * 0.9)
+    bd = r["braking_distance"]
+    status = "PASS" if bd <= safe_dist else ("WARNING" if bd <= safe_dist * 1.8 else "FAIL")
+    j.append({
+        "항목": "제동 안정성",
+        "판정": status,
+        "결과값": f"제동거리 {bd:.2f} m / 기준 {safe_dist:.2f} m",
+        "판정 기준": "PASS: 기준거리 이하, WARNING: 기준의 1.8배 이하, FAIL: 기준의 1.8배 초과",
+        "근거": "노면 마찰계수와 목표 속도 기반의 단순 제동거리 계산",
+        "주 원인": "속도 또는 질량이 높고 노면 마찰이 낮아 정지 거리가 길어짐",
+        "해결방안": "전자식 브레이크/기계식 브레이크 보강, 최고속도 제한, 접지력 높은 타이어 사용"
+    })
+    return j
 
 
-def run_simulation(design, env):
-    g = 9.81
-    mass = max(0.1, design["mass"] + env["payload_kg"])
-    target_speed = max(0.01, design["target_speed"])
-    wheels = max(1, int(design["wheels"]))
-    wheel_r = max(0.02, design["wheel_radius"])
-    motor_rpm = max(1.0, design["motor_rpm"])
-    motor_torque = max(0.001, design["motor_torque"])
-    gear_ratio = max(1.0, design["gear_ratio"])
+def calc_score(judgements):
+    score = 0
+    for x in judgements:
+        score += {"PASS": 16.7, "WARNING": 9.0, "FAIL": 2.0}.get(x["판정"], 0)
+    return round(min(score, 100), 1)
 
-    road = ROAD_PROFILES[env["road"]]
-    control = CONTROL_MODES[env["control_mode"]]
-    efficiency = min(0.96, max(0.40, design["efficiency"] + control["eff_bonus"]))
-    grade_deg = env["grade_deg"]
-    obstacle_factor = OBSTACLE_LEVELS[env["obstacle"]]
 
-    # 구동 가능 토크/힘
-    wheel_torque_each = motor_torque * gear_ratio * efficiency
-    total_traction_force = (wheel_torque_each / wheel_r) * wheels
+def status_color(status):
+    return {"PASS": "#0aa66a", "WARNING": "#f0a202", "FAIL": "#e74c3c"}.get(status, "#888")
 
-    # 접지 한계
-    traction_limit = road["mu"] * mass * g * math.cos(math.radians(grade_deg)) * (1 + control["traction_bonus"])
-    usable_traction_force = min(total_traction_force, traction_limit)
-
-    # 저항력
-    rolling_force = road["crr"] * mass * g * math.cos(math.radians(grade_deg)) * road["rough"] * obstacle_factor
-    grade_force = mass * g * math.sin(math.radians(grade_deg))
-    aero_force = 0.5 * 1.225 * 0.8 * 0.7 * (target_speed ** 2) if env["use_air_drag"] else 0.0
-    required_force = rolling_force + grade_force + aero_force
-
-    # 속도 한계
-    wheel_rpm = motor_rpm / gear_ratio
-    vmax_mps = (2 * math.pi * wheel_r) * wheel_rpm / 60.0
-    speed_achievement = min(vmax_mps / target_speed, 1.5) * 100
-
-    # 가속
-    net_force = usable_traction_force - required_force
-    acceleration = max(0.0, net_force / mass)
-    accel_time = target_speed / acceleration if acceleration > 0.02 else float("inf")
-
-    # 등판 한계: traction >= rolling + m*g*sin(theta)
-    max_grade_rad = 0.0
-    available_for_grade = usable_traction_force - (road["crr"] * mass * g * road["rough"] * obstacle_factor) - aero_force
-    if available_for_grade > 0:
-        ratio = min(1.0, max(0.0, available_for_grade / (mass * g)))
-        max_grade_rad = math.asin(ratio)
-    max_grade_deg = math.degrees(max_grade_rad)
-
-    # 토크 여유율
-    required_wheel_torque_each = (required_force * wheel_r) / wheels
-    torque_margin = ((wheel_torque_each - required_wheel_torque_each) / max(required_wheel_torque_each, 0.001)) * 100
-
-    # 배터리/전력
-    cruise_speed = min(target_speed, vmax_mps)
-    mechanical_power = max(required_force * cruise_speed, 0.0)
-    electrical_power = mechanical_power / max(efficiency, 0.1)
-    # 가속/장애물 보정
-    avg_power = electrical_power * (1.0 + min(max(env["obstacle_target_weight"], 0), 0.35)) + 15
-    if design.get("required_power_w_from_design", 0) > 0:
-        avg_power = max(avg_power, design["required_power_w_from_design"] * 0.75)
-    battery_wh = max(1.0, design["battery_wh"])
-    runtime_h = battery_wh / max(avg_power, 1.0)
-    runtime_min = runtime_h * 60
-    range_m = runtime_h * cruise_speed * 3600
-    required_time_min = env["target_time_min"]
-
-    # 발열: 모터의 기계적 정격 근사 = 토크 * 각속도
-    motor_rated_power_each = motor_torque * (2 * math.pi * motor_rpm / 60.0)
-    total_motor_rated_power = max(1.0, motor_rated_power_each * wheels)
-    load_ratio = (avg_power / max(total_motor_rated_power, 1.0)) * 100 * control["heat_factor"]
-
-    if load_ratio < 60:
-        heat_level = "낮음"
-    elif load_ratio < 85:
-        heat_level = "주의"
-    elif load_ratio < 110:
-        heat_level = "높음"
-    else:
-        heat_level = "위험"
-
-    # 제동 거리
-    brake_mu = max(0.15, road["mu"] * 0.72)
-    decel = brake_mu * g * math.cos(math.radians(grade_deg)) - g * math.sin(math.radians(grade_deg)) * 0.2
-    decel = max(0.4, decel)
-    braking_distance = (target_speed ** 2) / (2 * decel)
-    safe_braking_limit = max(1.5, target_speed * 1.2)
-
-    # 시간 기반 간이 프로파일
-    duration = max(10, int(env["target_time_min"] * 60))
-    samples = min(180, max(40, duration))
-    t_values = [i * duration / (samples - 1) for i in range(samples)]
-    speeds = []
-    distances = []
-    batteries = []
-    torque_usages = []
-    dist = 0.0
-    battery_pct = 100.0
-    dt = duration / (samples - 1)
-    for t in t_values:
-        if accel_time != float("inf") and t < accel_time:
-            v = min(target_speed, acceleration * t)
-        else:
-            v = min(target_speed, vmax_mps)
-        # 후반부 10% 제동 표현
-        if t > duration * 0.9:
-            ratio = max(0.0, 1 - (t - duration * 0.9) / (duration * 0.1))
-            v *= ratio
-        dist += v * dt
-        consumed_wh = avg_power * (t / 3600.0)
-        battery_pct = max(0.0, 100.0 * (1 - consumed_wh / battery_wh))
-        torque_usage = min(160.0, 100.0 * required_wheel_torque_each / max(wheel_torque_each, 0.001))
-        speeds.append(v)
-        distances.append(dist)
-        batteries.append(battery_pct)
-        torque_usages.append(torque_usage)
-
-    # 판정
-    speed_status = evaluate_status(
-        speed_achievement,
-        lambda x: x >= 95,
-        lambda x: x >= 75,
-    )
-    torque_status = evaluate_status(
-        torque_margin,
-        lambda x: x >= 30,
-        lambda x: x >= 0,
-    )
-    grade_status = evaluate_status(
-        max_grade_deg - grade_deg,
-        lambda x: x >= 3,
-        lambda x: x >= 0,
-    )
-    battery_status = evaluate_status(
-        runtime_min / max(required_time_min, 0.1) * 100,
-        lambda x: x >= 100,
-        lambda x: x >= 70,
-    )
-    heat_status = "PASS" if heat_level in ["낮음", "주의"] else "WARNING" if heat_level == "높음" else "FAIL"
-    brake_status = evaluate_status(
-        safe_braking_limit - braking_distance,
-        lambda x: x >= 0.5,
-        lambda x: x >= 0,
-    )
-
-    statuses = {
-        "속도": speed_status,
-        "토크": torque_status,
-        "등판": grade_status,
-        "배터리": battery_status,
-        "발열": heat_status,
-        "제동": brake_status,
-    }
-
-    score_map = {"PASS": 100, "WARNING": 65, "FAIL": 25}
-    weights = {"속도": 0.18, "토크": 0.24, "등판": 0.18, "배터리": 0.15, "발열": 0.13, "제동": 0.12}
-    total_score = sum(score_map[statuses[k]] * weights[k] for k in statuses)
-
-    return {
-        "mass_total": mass,
-        "wheel_torque_each": wheel_torque_each,
-        "required_wheel_torque_each": required_wheel_torque_each,
-        "torque_margin": torque_margin,
-        "total_traction_force": total_traction_force,
-        "usable_traction_force": usable_traction_force,
-        "traction_limit": traction_limit,
-        "required_force": required_force,
-        "rolling_force": rolling_force,
-        "grade_force": grade_force,
-        "aero_force": aero_force,
-        "vmax_mps": vmax_mps,
-        "speed_achievement": speed_achievement,
-        "acceleration": acceleration,
-        "accel_time": accel_time,
-        "max_grade_deg": max_grade_deg,
-        "avg_power": avg_power,
-        "runtime_min": runtime_min,
-        "range_m": range_m,
-        "load_ratio": load_ratio,
-        "heat_level": heat_level,
-        "braking_distance": braking_distance,
-        "safe_braking_limit": safe_braking_limit,
-        "statuses": statuses,
-        "total_score": total_score,
-        "t_values": t_values,
-        "speeds": speeds,
-        "distances": distances,
-        "batteries": batteries,
-        "torque_usages": torque_usages,
-        "road_desc": road["desc"],
-        "control_desc": control["desc"],
-        "efficiency_used": efficiency,
-    }
 
 # -----------------------------
-# 3D 시각화 함수
+# 시각화
 # -----------------------------
-def cuboid_vertices(origin, size):
-    x, y, z = origin
-    dx, dy, dz = size
-    return [
-        [(x, y, z), (x+dx, y, z), (x+dx, y+dy, z), (x, y+dy, z)],
-        [(x, y, z+dz), (x+dx, y, z+dz), (x+dx, y+dy, z+dz), (x, y+dy, z+dz)],
-        [(x, y, z), (x+dx, y, z), (x+dx, y, z+dz), (x, y, z+dz)],
-        [(x, y+dy, z), (x+dx, y+dy, z), (x+dx, y+dy, z+dz), (x, y+dy, z+dz)],
-        [(x, y, z), (x, y+dy, z), (x, y+dy, z+dz), (x, y, z+dz)],
-        [(x+dx, y, z), (x+dx, y+dy, z), (x+dx, y+dy, z+dz), (x+dx, y, z+dz)],
+def detect_shape(purpose, extra=""):
+    s = (str(purpose) + " " + str(extra)).lower()
+    if "킥보드" in s or "스쿠터" in s:
+        return "scooter"
+    if "전기차" in s or "자동차" in s or "ev" in s:
+        return "car"
+    if "궤도" in s or "트랙" in s or "track" in s or "험지" in s:
+        return "tracked"
+    if "청소" in s or "스위피" in s:
+        return "cleaner"
+    if "frc" in s or "대회" in s or "shooter" in s or "intake" in s:
+        return "competition"
+    return "platform"
+
+
+def cuboid_data(origin, size):
+    ox, oy, oz = origin
+    l, w, h = size
+    x = [ox, ox+l]
+    y = [oy, oy+w]
+    z = [oz, oz+h]
+    vertices = [
+        [(x[0],y[0],z[0]), (x[1],y[0],z[0]), (x[1],y[1],z[0]), (x[0],y[1],z[0])],
+        [(x[0],y[0],z[1]), (x[1],y[0],z[1]), (x[1],y[1],z[1]), (x[0],y[1],z[1])],
+        [(x[0],y[0],z[0]), (x[1],y[0],z[0]), (x[1],y[0],z[1]), (x[0],y[0],z[1])],
+        [(x[0],y[1],z[0]), (x[1],y[1],z[0]), (x[1],y[1],z[1]), (x[0],y[1],z[1])],
+        [(x[0],y[0],z[0]), (x[0],y[1],z[0]), (x[0],y[1],z[1]), (x[0],y[0],z[1])],
+        [(x[1],y[0],z[0]), (x[1],y[1],z[0]), (x[1],y[1],z[1]), (x[1],y[0],z[1])],
     ]
+    return vertices
 
 
-def add_box(ax, origin, size, color, alpha=0.75, edge="#111827"):
-    verts = cuboid_vertices(origin, size)
-    poly = Poly3DCollection(verts, facecolors=color, edgecolors=edge, linewidths=0.8, alpha=alpha)
-    ax.add_collection3d(poly)
+def add_box(ax, origin, size, color="#4682b4", alpha=0.65):
+    pc = Poly3DCollection(cuboid_data(origin, size), facecolors=color, linewidths=0.8, edgecolors="#222", alpha=alpha)
+    ax.add_collection3d(pc)
 
 
-def add_wheel(ax, x, y, z, r=0.18, width=0.08, color="#111827"):
-    # 간단한 원통형 바퀴: 두 원 + 연결선
-    theta = [i * 2 * math.pi / 32 for i in range(33)]
-    ys = [y - width/2, y + width/2]
-    for yy in ys:
-        xs = [x + r * math.cos(t) for t in theta]
-        zs = [z + r * math.sin(t) for t in theta]
-        ax.plot(xs, [yy]*len(xs), zs, color=color, linewidth=2.0)
-    for t in theta[::4]:
-        ax.plot([x + r*math.cos(t), x + r*math.cos(t)], [y-width/2, y+width/2], [z + r*math.sin(t), z + r*math.sin(t)], color=color, linewidth=1.0)
+def add_wheel(ax, x, y, z, r=0.18, color="#222"):
+    # 간단한 3D 바퀴 표현: 원형 단면 두 개와 축선
+    theta = [2*math.pi*i/36 for i in range(37)]
+    xs = [x for _ in theta]
+    ys = [y + r*math.cos(t) for t in theta]
+    zs = [z + r*math.sin(t) for t in theta]
+    ax.plot(xs, ys, zs, color=color, linewidth=3)
+    ax.plot([x-0.06, x+0.06], [y, y], [z, z], color=color, linewidth=5)
 
 
-def draw_3d_scene(design, env, sim):
-    vehicle_type = design.get("vehicle_type") or infer_vehicle_type(design.get("mobility_name", ""), design.get("purpose", ""), design.get("extra", ""))
-    fig = plt.figure(figsize=(9.5, 6.2))
+def draw_3d_scene(spec, env, result):
+    shape = detect_shape(spec["purpose"], spec.get("extra", ""))
+    fig = plt.figure(figsize=(9.5, 5.7))
     ax = fig.add_subplot(111, projection="3d")
-    ax.set_facecolor("#f8fafc")
-
-    # Ground / slope
-    grade = env["grade_deg"]
-    slope_z = math.tan(math.radians(min(grade, 28))) * 3.0
-    ground = [[(-2.2, -1.6, 0), (4.2, -1.6, slope_z), (4.2, 1.6, slope_z), (-2.2, 1.6, 0)]]
-    ax.add_collection3d(Poly3DCollection(ground, facecolors="#d1fae5", edgecolors="#059669", alpha=0.58))
-
-    # Obstacle blocks
-    if env["obstacle"] != "없음":
-        add_box(ax, (2.0, -0.75, slope_z*0.55), (0.22, 0.35, 0.16), "#9ca3af", 0.85)
-        add_box(ax, (2.55, 0.45, slope_z*0.68), (0.28, 0.28, 0.22), "#9ca3af", 0.85)
-
-    # Vehicle position responds to speed achievement and grade
-    x0 = 0.0 + min(1.2, sim["speed_achievement"] / 100.0)
-    z0 = 0.35 + math.tan(math.radians(min(grade, 28))) * (x0 + 0.8) * 0.15
-
-    # Different simple 3D shapes by mobility type
-    if vehicle_type == "scooter":
-        # Deck + handlebar
-        add_box(ax, (x0-0.6, -0.14, z0), (1.25, 0.28, 0.12), "#3b82f6", 0.85)
-        add_box(ax, (x0+0.35, -0.035, z0+0.10), (0.07, 0.07, 0.95), "#111827", 0.92)
-        add_box(ax, (x0+0.12, -0.38, z0+1.02), (0.55, 0.07, 0.06), "#111827", 0.92)
-        add_wheel(ax, x0-0.52, -0.18, z0-0.05, 0.19, 0.09)
-        add_wheel(ax, x0+0.57, -0.18, z0-0.05, 0.19, 0.09)
-        label = "Scooter-type mobility running on virtual course"
-    elif vehicle_type == "car":
-        add_box(ax, (x0-0.8, -0.48, z0), (1.6, 0.96, 0.35), "#2563eb", 0.82)
-        add_box(ax, (x0-0.35, -0.38, z0+0.32), (0.75, 0.76, 0.38), "#60a5fa", 0.62)
-        for wx in [x0-0.55, x0+0.55]:
-            add_wheel(ax, wx, -0.55, z0, 0.18, 0.10)
-            add_wheel(ax, wx, 0.55, z0, 0.18, 0.10)
-        label = "Car-type mobility climbing and cruising in virtual environment"
-    elif vehicle_type == "tracked":
-        add_box(ax, (x0-0.75, -0.42, z0+0.10), (1.5, 0.84, 0.42), "#f97316", 0.82)
-        add_box(ax, (x0-0.20, -0.15, z0+0.52), (0.48, 0.30, 0.38), "#fdba74", 0.75)
-        # track belts
-        add_box(ax, (x0-0.88, -0.62, z0-0.02), (1.76, 0.18, 0.20), "#111827", 0.88)
-        add_box(ax, (x0-0.88, 0.44, z0-0.02), (1.76, 0.18, 0.20), "#111827", 0.88)
-        for wx in [x0-0.55, x0, x0+0.55]:
-            add_wheel(ax, wx, -0.70, z0+0.08, 0.13, 0.05)
-            add_wheel(ax, wx, 0.70, z0+0.08, 0.13, 0.05)
-        label = "Tracked robot passing rough terrain with high torque mode"
-    elif vehicle_type == "cleaner":
-        add_box(ax, (x0-0.58, -0.46, z0+0.03), (1.16, 0.92, 0.28), "#14b8a6", 0.82)
-        add_box(ax, (x0-0.38, -0.32, z0+0.31), (0.76, 0.64, 0.22), "#99f6e4", 0.70)
-        add_box(ax, (x0+0.50, -0.38, z0-0.02), (0.13, 0.76, 0.10), "#0f766e", 0.88)
-        add_wheel(ax, x0-0.42, -0.52, z0+0.02, 0.16, 0.08)
-        add_wheel(ax, x0+0.42, -0.52, z0+0.02, 0.16, 0.08)
-        label = "Indoor cleaning robot moving with stable low-speed traction"
-    elif vehicle_type == "competition":
-        add_box(ax, (x0-0.70, -0.50, z0+0.03), (1.4, 1.0, 0.28), "#ef4444", 0.78)
-        add_box(ax, (x0+0.44, -0.32, z0+0.22), (0.38, 0.64, 0.32), "#fca5a5", 0.65)
-        add_box(ax, (x0-0.55, -0.28, z0+0.33), (0.50, 0.56, 0.30), "#fb7185", 0.62)
-        for wx in [x0-0.48, x0+0.48]:
-            add_wheel(ax, wx, -0.58, z0+0.04, 0.17, 0.09)
-            add_wheel(ax, wx, 0.58, z0+0.04, 0.17, 0.09)
-        label = "Competition robot accelerating while operating intake and shooter modules"
-    else:
-        add_box(ax, (x0-0.65, -0.42, z0+0.05), (1.3, 0.84, 0.34), "#8b5cf6", 0.78)
-        add_box(ax, (x0-0.25, -0.25, z0+0.38), (0.50, 0.50, 0.30), "#c4b5fd", 0.68)
-        for wx in [x0-0.45, x0+0.45]:
-            add_wheel(ax, wx, -0.50, z0+0.02, 0.16, 0.08)
-            add_wheel(ax, wx, 0.50, z0+0.02, 0.16, 0.08)
-        label = "Generic mobility platform running in virtual testbed"
-
-    # Motion arrow and status text in English only to avoid font breakage
-    ax.quiver(x0-0.9, 1.15, z0+0.35, 1.2, 0, 0.15, color="#dc2626", linewidth=2.2, arrow_length_ratio=0.12)
-    ax.text(x0-0.9, 1.25, z0+0.62, "Motion Direction", color="#dc2626", fontsize=10)
-    ax.text(-2.05, -1.45, 0.15, f"Road: {env['road']} / Grade: {grade:.1f} deg", color="#111827", fontsize=9)
-    ax.text(-2.05, -1.45, 0.38, f"Speed achievement: {sim['speed_achievement']:.0f}%", color="#111827", fontsize=9)
-    ax.set_title(label, fontsize=12, pad=12)
-
-    ax.set_xlim(-2.2, 4.2)
-    ax.set_ylim(-1.6, 1.6)
-    ax.set_zlim(0, 2.0)
-    ax.set_xlabel("X: Course Direction")
-    ax.set_ylabel("Y: Vehicle Width")
+    ax.set_facecolor("#f7f9fc")
+    ax.view_init(elev=23, azim=-58)
+    ax.set_xlim(0, 7); ax.set_ylim(-2.5, 2.5); ax.set_zlim(0, 2.5)
+    ax.set_xlabel("X: Course")
+    ax.set_ylabel("Y: Width")
     ax.set_zlabel("Z: Height")
-    ax.view_init(elev=22, azim=-58)
-    plt.tight_layout()
-    st.pyplot(fig)
 
+    # 경사면/코스
+    slope = math.radians(env["slope_deg"])
+    xs = [0, 7, 7, 0]
+    ys = [-2.2, -2.2, 2.2, 2.2]
+    z0 = 0
+    z1 = math.tan(slope) * 1.8
+    zs = [z0, z1, z1, z0]
+    ground = Poly3DCollection([list(zip(xs, ys, zs))], facecolors="#d8e8d2", alpha=0.65, edgecolors="#6b8e23")
+    ax.add_collection3d(ground)
 
-def draw_graphs(sim):
-    fig, axes = plt.subplots(2, 2, figsize=(11, 6.2))
-    t = sim["t_values"]
+    # 장애물
+    if env["obstacle"] != "없음":
+        h = {"낮음": 0.12, "중간": 0.22, "높음": 0.35}[env["obstacle"]]
+        add_box(ax, (4.6, -1.4, z1*0.65), (0.25, 2.8, h), "#9c6b30", 0.75)
+        ax.text(4.55, 1.65, z1*0.65+h+0.05, "Obstacle", fontsize=9, color="#333")
 
-    axes[0, 0].plot(t, sim["speeds"], color="#2563eb", linewidth=2)
-    axes[0, 0].set_title("Speed Profile")
-    axes[0, 0].set_xlabel("Time (s)")
-    axes[0, 0].set_ylabel("Speed (m/s)")
-    axes[0, 0].grid(alpha=0.3)
-
-    axes[0, 1].plot(t, sim["distances"], color="#16a34a", linewidth=2)
-    axes[0, 1].set_title("Distance Profile")
-    axes[0, 1].set_xlabel("Time (s)")
-    axes[0, 1].set_ylabel("Distance (m)")
-    axes[0, 1].grid(alpha=0.3)
-
-    axes[1, 0].plot(t, sim["batteries"], color="#f59e0b", linewidth=2)
-    axes[1, 0].set_title("Battery Remaining")
-    axes[1, 0].set_xlabel("Time (s)")
-    axes[1, 0].set_ylabel("Battery (%)")
-    axes[1, 0].grid(alpha=0.3)
-
-    axes[1, 1].plot(t, sim["torque_usages"], color="#dc2626", linewidth=2)
-    axes[1, 1].axhline(100, color="#111827", linestyle="--", linewidth=1)
-    axes[1, 1].set_title("Torque Usage")
-    axes[1, 1].set_xlabel("Time (s)")
-    axes[1, 1].set_ylabel("Torque Usage (%)")
-    axes[1, 1].grid(alpha=0.3)
-
-    plt.tight_layout()
-    st.pyplot(fig)
-
-
-def analyze_causes_and_solutions(design, env, sim):
-    statuses = sim["statuses"]
-    problems = []
-
-    if statuses["속도"] != "PASS":
-        problems.append({
-            "항목": "목표 속도",
-            "주 원인": f"모터 RPM과 기어비로 계산한 예상 최고속도({sim['vmax_mps']:.2f} m/s)가 목표속도({design['target_speed']:.2f} m/s)에 충분히 도달하지 못합니다.",
-            "해결방안": "기어비를 낮춰 속도형으로 조정하거나, 모터 RPM이 더 높은 부품을 선택하고 바퀴 반지름을 재검토합니다. 단, 기어비를 낮추면 토크 여유가 감소할 수 있습니다.",
-        })
-    if statuses["토크"] != "PASS":
-        problems.append({
-            "항목": "토크 여유",
-            "주 원인": f"바퀴당 사용 가능 토크({sim['wheel_torque_each']:.2f} Nm) 대비 요구 토크({sim['required_wheel_torque_each']:.2f} Nm)의 여유율이 {sim['torque_margin']:.1f}%입니다.",
-            "해결방안": "기어비를 높여 토크형으로 바꾸거나, 모터 토크가 더 큰 구동계를 사용합니다. 질량과 적재 하중을 줄이는 것도 효과적입니다.",
-        })
-    if statuses["등판"] != "PASS":
-        problems.append({
-            "항목": "등판 성능",
-            "주 원인": f"설정 경사각({env['grade_deg']:.1f}°)이 최대 등판 가능각({sim['max_grade_deg']:.1f}°)에 너무 근접하거나 초과합니다.",
-            "해결방안": "경사 환경에서는 감속비를 높이고, 접지력이 큰 바퀴/궤도 구조를 적용하며, 무게중심을 낮춰 슬립 위험을 줄입니다.",
-        })
-    if statuses["배터리"] != "PASS":
-        problems.append({
-            "항목": "배터리 지속성",
-            "주 원인": f"예상 주행 가능 시간({sim['runtime_min']:.1f}분)이 목표 주행 시간({env['target_time_min']:.1f}분)에 부족하거나 여유가 작습니다.",
-            "해결방안": "배터리 용량(Wh)을 늘리거나 효율 우선 제어를 적용하고, 구름저항이 작은 바퀴와 경량 구조를 사용합니다.",
-        })
-    if statuses["발열"] != "PASS":
-        problems.append({
-            "항목": "발열 위험",
-            "주 원인": f"부하율이 약 {sim['load_ratio']:.1f}%로 계산되어 모터/드라이버가 장시간 고부하 상태일 가능성이 있습니다.",
-            "해결방안": "정격 출력이 더 큰 모터와 드라이버를 사용하거나, 발열 억제 제어·방열판·냉각팬을 적용합니다. 연속 운전 시간을 제한하는 것도 필요합니다.",
-        })
-    if statuses["제동"] != "PASS":
-        problems.append({
-            "항목": "제동 안정성",
-            "주 원인": f"예상 제동 거리({sim['braking_distance']:.2f} m)가 안전 기준거리({sim['safe_braking_limit']:.2f} m)에 근접하거나 초과합니다.",
-            "해결방안": "전자식 브레이크, 회생제동, 기계식 보조 브레이크를 추가하고 고속 주행 시 제한속도 로직을 적용합니다.",
-        })
-
-    return problems
-
-
-def make_report_text(design, env, sim, problems):
-    overall = "적합" if sim["total_score"] >= 80 else "조건부 적합" if sim["total_score"] >= 60 else "개선 필요"
-    fail_items = [k for k, v in sim["statuses"].items() if v != "PASS"]
-    fail_text = ", ".join(fail_items) if fail_items else "없음"
-
-    base = f"""
-    해당 모빌리티는 '{design['mobility_name']}' 용도로 설정되었으며, 총 시험 질량은 {sim['mass_total']:.1f} kg, 목표 속도는 {design['target_speed']:.2f} m/s이다.
-    가상환경은 {env['road']} 노면, 경사각 {env['grade_deg']:.1f}°, 장애물 수준 {env['obstacle']} 조건으로 구성하였다.
-    시뮬레이션 결과 예상 최고속도는 {sim['vmax_mps']:.2f} m/s, 토크 여유율은 {sim['torque_margin']:.1f}%, 예상 주행 가능 시간은 {sim['runtime_min']:.1f}분으로 계산되었다.
-    종합 점수는 {sim['total_score']:.1f}/100점이며, 전체 판정은 '{overall}'으로 해석할 수 있다.
-    PASS가 아닌 항목은 {fail_text}이다.
-    """
-    if problems:
-        problem_text = "\n".join([f"- {p['항목']}: {p['주 원인']} 해결을 위해 {p['해결방안']}" for p in problems])
+    # 모빌리티 위치
+    bx, by, bz = 2.4, -0.7, 0.35 + math.tan(slope)*0.65
+    if shape == "scooter":
+        add_box(ax, (bx, by, bz), (1.8, 0.35, 0.13), "#2e86de", 0.78)  # deck
+        add_box(ax, (bx+1.45, by+0.13, bz+0.1), (0.08, 0.08, 1.05), "#555", 0.9)  # handle
+        add_wheel(ax, bx+0.2, by+0.18, bz-0.05, 0.22)
+        add_wheel(ax, bx+1.65, by+0.18, bz-0.05, 0.22)
+        ax.text(bx+0.5, by-0.5, bz+0.55, "Simple 3D Scooter Mobility", fontsize=10)
+    elif shape == "car":
+        add_box(ax, (bx, by, bz), (2.1, 1.2, 0.45), "#e67e22", 0.72)
+        add_box(ax, (bx+0.55, by+0.2, bz+0.42), (0.9, 0.8, 0.45), "#f6c85f", 0.55)
+        for wx in [bx+0.25, bx+1.85]:
+            add_wheel(ax, wx, by-0.05, bz-0.05, 0.20); add_wheel(ax, wx, by+1.25, bz-0.05, 0.20)
+        ax.text(bx+0.35, by-0.7, bz+0.85, "Simple 3D Vehicle Mobility", fontsize=10)
+    elif shape == "tracked":
+        add_box(ax, (bx, by, bz), (1.9, 1.1, 0.45), "#607d3b", 0.78)
+        add_box(ax, (bx-0.05, by-0.12, bz-0.1), (2.0, 0.22, 0.22), "#333", 0.9)
+        add_box(ax, (bx-0.05, by+1.0, bz-0.1), (2.0, 0.22, 0.22), "#333", 0.9)
+        add_box(ax, (bx+0.75, by+0.35, bz+0.45), (0.16, 0.16, 0.8), "#555", 0.8)
+        ax.text(bx+0.2, by-0.7, bz+0.9, "Simple 3D Tracked Mobility", fontsize=10)
+    elif shape == "cleaner":
+        add_box(ax, (bx, by, bz), (1.6, 1.25, 0.32), "#7f8c8d", 0.75)
+        add_box(ax, (bx+0.1, by+0.15, bz+0.32), (1.4, 0.95, 0.18), "#95a5a6", 0.7)
+        add_wheel(ax, bx+0.25, by+0.05, bz-0.03, 0.18); add_wheel(ax, bx+1.35, by+1.20, bz-0.03, 0.18)
+        ax.text(bx+0.1, by-0.7, bz+0.75, "Simple 3D Cleaning Robot", fontsize=10)
+    elif shape == "competition":
+        add_box(ax, (bx, by, bz), (1.8, 1.2, 0.50), "#c0392b", 0.68)
+        add_box(ax, (bx+1.45, by+0.15, bz+0.25), (0.35, 0.9, 0.25), "#34495e", 0.65)  # intake
+        add_box(ax, (bx+0.45, by+0.25, bz+0.55), (0.65, 0.7, 0.55), "#8e44ad", 0.55)  # shooter
+        for wx in [bx+0.2, bx+1.55]:
+            add_wheel(ax, wx, by-0.05, bz-0.05, 0.19); add_wheel(ax, wx, by+1.25, bz-0.05, 0.19)
+        ax.text(bx+0.1, by-0.8, bz+1.15, "Simple 3D Competition Robot", fontsize=10)
     else:
-        problem_text = "- 모든 핵심 항목이 PASS로 판정되어 현재 조건에서는 큰 성능 병목이 발견되지 않았다. 다만 실제 제작 전에는 센서 오차, 부품 효율, 노면 변화에 대한 추가 검증이 필요하다."
-    return textwrap.dedent(base).strip() + "\n\n주요 원인 및 개선 방향:\n" + problem_text
+        add_box(ax, (bx, by, bz), (1.8, 1.1, 0.42), "#3498db", 0.72)
+        add_box(ax, (bx+0.45, by+0.25, bz+0.42), (0.8, 0.6, 0.25), "#85c1e9", 0.65)
+        for wx in [bx+0.25, bx+1.55]:
+            add_wheel(ax, wx, by-0.05, bz-0.05, 0.18); add_wheel(ax, wx, by+1.15, bz-0.05, 0.18)
+        ax.text(bx+0.2, by-0.7, bz+0.85, "Simple 3D Mobility Platform", fontsize=10)
+
+    ax.quiver(5.5, -1.7, 0.25+z1*0.8, 0.8, 0, 0.15, color="#e74c3c", linewidth=2)
+    ax.text(5.45, -1.9, 0.55+z1*0.8, "Driving Direction", color="#e74c3c", fontsize=9)
+    ax.text(0.15, -2.1, 1.85, f"Speed: {result['predicted_max_speed']:.2f} m/s", fontsize=9)
+    ax.text(0.15, -2.1, 1.65, f"Slope: {env['slope_deg']:.1f} deg", fontsize=9)
+    ax.text(0.15, -2.1, 1.45, f"Road: {env['road']}", fontsize=9)
+    plt.tight_layout()
+    return fig
+
+
+def draw_graphs(result):
+    fig, axes = plt.subplots(2, 2, figsize=(11, 6))
+    axes[0,0].plot(result["time"], result["speed_series"], color="#1f77b4")
+    axes[0,0].set_title("Speed-Time")
+    axes[0,0].set_xlabel("Time (s)"); axes[0,0].set_ylabel("Speed (m/s)"); axes[0,0].grid(True, alpha=0.3)
+
+    axes[0,1].plot(result["time"], result["distance_series"], color="#2ca02c")
+    axes[0,1].set_title("Distance-Time")
+    axes[0,1].set_xlabel("Time (s)"); axes[0,1].set_ylabel("Distance (m)"); axes[0,1].grid(True, alpha=0.3)
+
+    axes[1,0].plot(result["time"], result["battery_series"], color="#ff7f0e")
+    axes[1,0].set_title("Battery Remaining")
+    axes[1,0].set_xlabel("Time (s)"); axes[1,0].set_ylabel("Battery (%)"); axes[1,0].grid(True, alpha=0.3)
+
+    axes[1,1].plot(result["time"], result["torque_use_series"], color="#d62728")
+    axes[1,1].axhline(100, color="#555", linestyle="--", linewidth=1)
+    axes[1,1].set_title("Torque Usage")
+    axes[1,1].set_xlabel("Time (s)"); axes[1,1].set_ylabel("Torque Usage (%)"); axes[1,1].grid(True, alpha=0.3)
+    plt.tight_layout()
+    return fig
+
+
+def make_report(spec, env, result):
+    not_pass = [x for x in result["judgements"] if x["판정"] != "PASS"]
+    if not_pass:
+        weak = ", ".join([x["항목"] for x in not_pass])
+        improve = " / ".join([x["해결방안"] for x in not_pass[:3]])
+    else:
+        weak = "뚜렷한 취약 항목 없음"
+        improve = "현재 조건에서는 목표 성능을 대체로 만족하므로 실제 제작 전 안전율과 부품 정격 검증을 추가하면 됩니다."
+
+    return f"""
+해당 모빌리티는 '{spec['purpose']}' 조건에서 총 질량 {result['mass_total']:.1f} kg, 목표 속도 {spec['target_speed']:.2f} m/s, 기어비 {spec['gear_ratio']:.1f}:1을 기준으로 가상 주행을 수행하였다. 
+설정 환경은 {env['road']}, 경사각 {env['slope_deg']:.1f}°, 장애물 수준 '{env['obstacle']}'이며, 예측 최고 속도는 {result['predicted_max_speed']:.2f} m/s, 토크 여유율은 {result['torque_margin']:.1f}%, 예상 주행 가능 시간은 {result['runtime_h']*60:.1f}분으로 계산되었다. 
+종합 점수는 {result['score']:.1f}/100점이며, PASS가 아닌 주요 항목은 {weak}이다. 개선 방향은 {improve}
+""".strip()
+
 
 # -----------------------------
-# 앱 본문
+# UI 시작
 # -----------------------------
-st.markdown('<div class="main-title">🧪 가상환경 모빌리티 테스트베드</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="sub-desc">초기 설계 도움 시스템의 결과 또는 사용자가 직접 입력한 모빌리티 스펙을 바탕으로, 실제 제작 전 가상환경에서 주행 가능성·성능 한계·위험 요소를 예측합니다.</div>',
-    unsafe_allow_html=True,
-)
+st.title("🌐 가상환경 모빌리티 테스트베드")
+st.caption("초기 설계 도움 시스템에서 복사한 설계 요약문/JSON을 붙여넣거나, 직접 모빌리티 스펙을 입력해 가상환경에서 주행 성능을 예측합니다.")
 
-with st.expander("이 시뮬레이터의 역할", expanded=False):
-    st.write(
-        """
-        이 프로그램은 단순 계산기가 아니라, 아직 실제 제작이 어렵거나 미완성 상태인 모빌리티를 가상환경에서 먼저 시험하기 위한 테스트베드입니다.
-        초기 설계 도움 시스템에서 복사한 텍스트를 붙여넣어 빠르게 시작할 수 있고, 설계 시스템 없이도 직접 스펙을 입력해 독립적으로 사용할 수 있습니다.
-        """
-    )
+if "paste_text" not in st.session_state:
+    st.session_state["paste_text"] = ""
 
-# 세션 상태 초기화
-if "design" not in st.session_state:
-    st.session_state.design = None
-if "last_raw_text" not in st.session_state:
-    st.session_state.last_raw_text = ""
-
-input_mode = st.radio(
-    "입력 방식 선택",
+mode = st.radio(
+    "입력 방식을 선택하세요.",
     ["초기 설계 도움 시스템에서 복사한 텍스트 붙여넣기", "자신의 모빌리티 스펙 직접 입력"],
-    horizontal=True,
+    horizontal=True
 )
 
-st.divider()
+parsed = st.session_state.get("parsed_data")
 
-# -----------------------------
-# 입력 방식 1: 붙여넣기
-# -----------------------------
-if input_mode == "초기 설계 도움 시스템에서 복사한 텍스트 붙여넣기":
-    st.subheader("1. 설계 데이터 붙여넣기")
-    st.write("초기 설계 도움 시스템에서 복사한 테스트베드용 JSON 또는 전체 요약문을 아래에 붙여넣으세요.")
-    raw_text = st.text_area(
-        "붙여넣기 영역",
-        value=st.session_state.last_raw_text,
-        height=230,
-        placeholder="예: [모빌리티 구동계 초기 설계 요약]\n용도: FRC/대회용 공 수집 및 발사 로봇\n질량: 55kg\n목표 속도: 2.0 m/s\n...",
-    )
+if mode == "초기 설계 도움 시스템에서 복사한 텍스트 붙여넣기":
+    st.header("1. 설계 데이터 붙여넣기")
+    st.write("초기 설계 도움 시스템에서 복사한 **테스트베드용 JSON 또는 전체 요약문**을 아래에 붙여넣으세요.")
     c1, c2 = st.columns([1, 1])
     with c1:
-        apply_btn = st.button("📥 붙여넣은 설계 데이터 적용", use_container_width=True)
+        st.button("🧹 붙여넣기란 비우기", on_click=clear_paste_text, use_container_width=True)
     with c2:
-        clear_btn = st.button("🧹 붙여넣기 내용 비우기", use_container_width=True)
+        sample = """[모빌리티 구동계 초기 설계 요약]\n용도: FRC/대회용 공 수집 및 발사 로봇\n스케일: 학생용\n질량: 15.0kg\n목표 속도: 5.0 m/s\n구동 바퀴 수: 4개\n운행 환경: 단순 이동 / 평지 중심\n기타 요구사항: intake, feeder, shooter, waterwheel, 3D 프린팅 브라켓\n\n[물리 모델 결과]\n요구 동력: 104 W\n바퀴당 요구 토크: 0.80 Nm\n필요 휠 RPM: 477.5 RPM\n추천 감속비: 6:1"""
+        if st.button("예시 요약문 넣기", use_container_width=True):
+            st.session_state["paste_text"] = sample
+            st.rerun()
 
-    if clear_btn:
-        st.session_state.last_raw_text = ""
-        st.session_state.design = None
-        st.rerun()
+    paste_text = st.text_area(
+        "붙여넣기 영역",
+        key="paste_text",
+        height=260,
+        placeholder="여기에 Ctrl+V로 붙여넣으세요. JSON이 아니어도 '용도:', '질량:', '목표 속도:' 같은 요약문이면 해석합니다."
+    )
 
-    if apply_btn:
+    if st.button("📥 붙여넣은 설계 데이터 적용", type="primary", use_container_width=True):
         try:
-            design = parse_design_text(raw_text)
-            st.session_state.design = design
-            st.session_state.last_raw_text = raw_text
-            st.success("설계 데이터를 성공적으로 적용했습니다. 아래의 모빌리티 스펙과 가상환경 조건을 확인한 뒤 시뮬레이션을 실행하세요.")
+            d = parse_pasted_design(st.session_state.get("paste_text", ""))
+            apply_parsed_to_session(d)
+            st.success(st.session_state["parse_message"])
+            st.rerun()
         except Exception as e:
             st.error(f"설계 데이터 해석에 실패했습니다: {e}")
-            st.info("JSON 형식이 아니어도 됩니다. 단, '용도:', '질량:', '목표 속도:', '구동 바퀴 수:'처럼 항목명과 콜론이 포함된 요약문이면 더 정확히 해석됩니다.")
+            st.info("JSON이 아니어도 됩니다. 단, '용도:', '질량:', '목표 속도:', '구동 바퀴 수:'처럼 항목명과 콜론(:)이 포함된 요약문이면 더 정확히 해석됩니다.")
 
-# -----------------------------
-# 입력 방식 2: 직접 입력
-# -----------------------------
+    if st.session_state.get("parse_message"):
+        st.success(st.session_state["parse_message"])
+
+    if parsed:
+        with st.expander("적용된 설계 데이터 요약", expanded=True):
+            st.json({k: v for k, v in parsed.items() if k not in ["source_text"]})
 else:
-    st.subheader("1. 자신의 모빌리티 스펙 직접 입력")
-    preset_name = st.selectbox("빠른 예시 프리셋", list(DIRECT_PRESETS.keys()))
-    preset = DIRECT_PRESETS[preset_name]
+    st.header("1. 직접 입력 모드")
+    st.info("붙여넣기 없이 아직 제작 전이거나 미완성인 모빌리티의 스펙을 직접 입력해 가상환경에서 시험할 수 있습니다.")
 
-    if preset_name == "직접 입력":
-        default = {
-            "mobility_name": "",
-            "purpose": "",
-            "mass": 0.0,
-            "target_speed": 0.0,
-            "wheels": 4,
-            "wheel_radius": 0.10,
-            "motor_rpm": 3000.0,
-            "motor_torque": 0.5,
-            "gear_ratio": 18.0,
-            "efficiency": 0.85,
-            "battery_wh": 500.0,
-        }
-    else:
-        default = preset
+# 입력 기본값 결정
+base = st.session_state.get("parsed_data", PURPOSE_PRESETS["일반 플랫폼형"].copy())
+if mode == "자신의 모빌리티 스펙 직접 입력" and "manual_initialized" not in st.session_state:
+    st.session_state["manual_initialized"] = True
+    for k, v in PURPOSE_PRESETS["일반 플랫폼형"].items():
+        st.session_state.setdefault(f"mob_{k}", v)
+    st.session_state.setdefault("mob_purpose", "직접 입력 모빌리티")
+    st.session_state.setdefault("mob_extra", "")
+    st.session_state.setdefault("mob_road", "실내 바닥")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        mobility_name = st.text_input("모빌리티 이름", value=default.get("mobility_name", ""))
-        purpose = st.text_area("용도/목표 기능", value=default.get("purpose", ""), height=90)
-        mass = st.number_input("총 질량 kg", min_value=0.0, value=float(default.get("mass", 0.0)), step=1.0)
-        target_speed = st.number_input("목표 속도 m/s", min_value=0.0, value=float(default.get("target_speed", 0.0)), step=0.1)
-        wheels = st.number_input("구동 바퀴 수", min_value=1, max_value=12, value=int(default.get("wheels", 4)), step=1)
-    with c2:
-        wheel_radius = st.number_input("바퀴 반지름 m", min_value=0.02, value=float(default.get("wheel_radius", 0.10)), step=0.01)
-        motor_rpm = st.number_input("모터 기준 RPM", min_value=1.0, value=float(default.get("motor_rpm", 3000.0)), step=100.0)
-        motor_torque = st.number_input("모터 연속 토크 Nm", min_value=0.001, value=float(default.get("motor_torque", 0.50)), step=0.05)
-        gear_ratio = st.number_input("기어비", min_value=1.0, value=float(default.get("gear_ratio", 18.0)), step=1.0)
-        efficiency = st.slider("구동계 효율", 0.40, 0.96, float(default.get("efficiency", 0.85)), 0.01)
-        battery_wh = st.number_input("배터리 용량 Wh", min_value=1.0, value=float(default.get("battery_wh", 500.0)), step=50.0)
+# 세션 기본값 세팅
+for k, v in {
+    "purpose": base.get("purpose", "붙여넣은 모빌리티"),
+    "mass": base.get("mass", 35.0),
+    "target_speed": base.get("target_speed", 1.5),
+    "wheels": base.get("wheels", 4),
+    "wheel_radius": base.get("wheel_radius", 0.10),
+    "motor_rpm": base.get("motor_rpm", 3000.0),
+    "motor_torque": base.get("motor_torque", 0.50),
+    "gear_ratio": base.get("gear_ratio", 18.0),
+    "battery_wh": base.get("battery_wh", 500.0),
+    "efficiency": base.get("efficiency", 0.85),
+    "road": base.get("road", "실내 바닥"),
+    "extra": base.get("extra", ""),
+}.items():
+    st.session_state.setdefault(f"mob_{k}", v)
 
-    extra = st.text_input("기타 특징/장치", value="")
-    if st.button("✅ 직접 입력값 적용", use_container_width=True):
-        if not mobility_name.strip() or mass <= 0 or target_speed <= 0:
-            st.warning("직접 입력 모드에서는 모빌리티 이름, 질량, 목표 속도를 입력해야 합니다.")
-        else:
-            design = {
-                "mobility_name": mobility_name.strip(),
-                "purpose": purpose.strip() or mobility_name.strip(),
-                "scale": "직접 입력",
-                "mass": mass,
-                "target_speed": target_speed,
-                "wheels": int(wheels),
-                "wheel_radius": wheel_radius,
-                "motor_rpm": motor_rpm,
-                "motor_torque": motor_torque,
-                "gear_ratio": gear_ratio,
-                "efficiency": efficiency,
-                "battery_wh": battery_wh,
-                "extra": extra,
-                "road": "실내 평지",
-                "source_type": "manual",
-                "required_power_w_from_design": 0.0,
-                "required_wheel_torque_nm_from_design": 0.0,
-                "required_wheel_rpm_from_design": 0.0,
-            }
-            design["vehicle_type"] = infer_vehicle_type(mobility_name, purpose, extra)
-            st.session_state.design = design
-            st.success("직접 입력한 모빌리티 스펙을 적용했습니다.")
+st.header("2. 모빌리티 스펙 확인 및 수정")
+left, right = st.columns(2)
+with left:
+    purpose = st.text_input("모빌리티 이름/용도", key="mob_purpose")
+    mass = st.number_input("총 질량 kg", min_value=0.1, max_value=5000.0, step=1.0, key="mob_mass")
+    target_speed = st.number_input("목표 속도 m/s", min_value=0.01, max_value=80.0, step=0.1, key="mob_target_speed")
+    wheels = st.number_input("구동 바퀴 수", min_value=1, max_value=12, step=1, key="mob_wheels")
+    wheel_radius = st.number_input("바퀴 반지름 m", min_value=0.02, max_value=1.5, step=0.01, key="mob_wheel_radius")
+with right:
+    motor_rpm = st.number_input("모터 RPM", min_value=100.0, max_value=30000.0, step=100.0, key="mob_motor_rpm")
+    motor_torque = st.number_input("모터 1개당 연속 토크 Nm", min_value=0.01, max_value=500.0, step=0.05, key="mob_motor_torque")
+    gear_ratio = st.number_input("감속비 / 기어비", min_value=1.0, max_value=300.0, step=0.5, key="mob_gear_ratio")
+    battery_wh = st.number_input("배터리 용량 Wh", min_value=10.0, max_value=200000.0, step=10.0, key="mob_battery_wh")
+    efficiency = st.slider("구동계 효율", min_value=0.30, max_value=0.98, step=0.01, key="mob_efficiency")
+extra = st.text_area("기타 특징/장치", key="mob_extra", height=80, placeholder="예: intake, feeder, shooter, LiDAR, 궤도, 방수 구조 등")
 
-# -----------------------------
-# 설계 데이터 요약 및 수정 가능 입력
-# -----------------------------
-design = st.session_state.design
-if design is None:
-    st.info("먼저 입력 방식을 선택하고 설계 데이터를 적용하세요. 붙여넣기 없이 직접 입력만으로도 사용할 수 있습니다.")
-    st.stop()
+st.header("3. 가상환경 조건 설정")
+col_a, col_b, col_c = st.columns(3)
+with col_a:
+    road = st.selectbox("노면 종류", list(ROAD_TABLE.keys()), index=list(ROAD_TABLE.keys()).index(st.session_state.get("mob_road", "실내 바닥")) if st.session_state.get("mob_road", "실내 바닥") in ROAD_TABLE else 0)
+    slope_deg = st.slider("경사각 deg", 0.0, 40.0, 5.0, 0.5)
+with col_b:
+    course_m = st.number_input("코스 길이 m", min_value=1.0, max_value=10000.0, value=50.0, step=5.0)
+    obstacle = st.selectbox("장애물 수준", ["없음", "낮음", "중간", "높음"], index=0)
+with col_c:
+    payload = st.number_input("추가 적재 하중 kg", min_value=0.0, max_value=3000.0, value=0.0, step=1.0)
+    target_runtime_min = st.number_input("목표 주행 시간 min", min_value=1.0, max_value=600.0, value=30.0, step=1.0)
+control = st.selectbox("전력/반도체 제어 방식", list(CONTROL_TABLE.keys()), index=0)
+air_drag = st.checkbox("공기저항 반영", value=True)
 
-st.divider()
-st.subheader("2. 적용된 모빌리티 스펙 확인/수정")
-
-c1, c2, c3 = st.columns(3)
-with c1:
-    design["mobility_name"] = st.text_input("모빌리티 이름", value=design.get("mobility_name", ""))
-    design["mass"] = st.number_input("총 질량 kg", min_value=0.1, value=float(design.get("mass", 35.0)), step=1.0, key="edit_mass")
-    design["target_speed"] = st.number_input("목표 속도 m/s", min_value=0.01, value=float(design.get("target_speed", 1.0)), step=0.1, key="edit_speed")
-with c2:
-    design["wheels"] = st.number_input("구동 바퀴 수", min_value=1, max_value=12, value=int(design.get("wheels", 4)), step=1, key="edit_wheels")
-    design["wheel_radius"] = st.number_input("바퀴 반지름 m", min_value=0.02, value=float(design.get("wheel_radius", 0.10)), step=0.01, key="edit_wheel_r")
-    design["gear_ratio"] = st.number_input("기어비", min_value=1.0, value=float(design.get("gear_ratio", 18.0)), step=1.0, key="edit_gear")
-with c3:
-    design["motor_rpm"] = st.number_input("모터 기준 RPM", min_value=1.0, value=float(design.get("motor_rpm", 3000.0)), step=100.0, key="edit_rpm")
-    design["motor_torque"] = st.number_input("모터 연속 토크 Nm", min_value=0.001, value=float(design.get("motor_torque", 0.5)), step=0.05, key="edit_torque")
-    design["battery_wh"] = st.number_input("배터리 용량 Wh", min_value=1.0, value=float(design.get("battery_wh", 500.0)), step=50.0, key="edit_battery")
-
-design["efficiency"] = st.slider("구동계 효율", 0.40, 0.96, float(design.get("efficiency", 0.85)), 0.01, key="edit_eff")
-design["purpose"] = st.text_area("용도/설명", value=design.get("purpose", ""), height=80)
-design["extra"] = st.text_input("기타 특징/장치", value=design.get("extra", ""))
-design["vehicle_type"] = infer_vehicle_type(design.get("mobility_name", ""), design.get("purpose", ""), design.get("extra", ""))
-st.session_state.design = design
-
-# -----------------------------
-# 가상환경 설정
-# -----------------------------
-st.divider()
-st.subheader("3. 가상환경 조건 설정")
-
-e1, e2, e3 = st.columns(3)
-with e1:
-    default_road = design.get("road", "실내 평지")
-    if default_road not in ROAD_PROFILES:
-        default_road = "실내 평지"
-    road = st.selectbox("노면 종류", list(ROAD_PROFILES.keys()), index=list(ROAD_PROFILES.keys()).index(default_road))
-    grade_deg = st.slider("경사각 °", 0.0, 35.0, 8.0 if road == "실내 평지" else 12.0, 0.5)
-with e2:
-    obstacle = st.selectbox("장애물 수준", list(OBSTACLE_LEVELS.keys()), index=1)
-    payload_kg = st.number_input("추가 적재 하중 kg", min_value=0.0, value=0.0, step=5.0)
-with e3:
-    target_time_min = st.number_input("목표 주행 시간 min", min_value=0.1, value=10.0, step=1.0)
-    control_mode = st.selectbox("전력/센서 제어 방식", list(CONTROL_MODES.keys()), index=0)
-    use_air_drag = st.checkbox("공기저항 반영", value=False)
-
-course_length_m = st.number_input("가상 코스 길이 m", min_value=1.0, value=50.0, step=5.0)
-
+spec = {
+    "purpose": purpose,
+    "mass": float(mass),
+    "target_speed": float(target_speed),
+    "wheels": int(wheels),
+    "wheel_radius": float(wheel_radius),
+    "motor_rpm": float(motor_rpm),
+    "motor_torque": float(motor_torque),
+    "gear_ratio": float(gear_ratio),
+    "battery_wh": float(battery_wh),
+    "efficiency": float(efficiency),
+    "extra": extra,
+}
 env = {
     "road": road,
-    "grade_deg": grade_deg,
+    "slope_deg": float(slope_deg),
+    "course_m": float(course_m),
     "obstacle": obstacle,
-    "payload_kg": payload_kg,
-    "target_time_min": target_time_min,
-    "course_length_m": course_length_m,
-    "control_mode": control_mode,
-    "use_air_drag": use_air_drag,
-    "obstacle_target_weight": OBSTACLE_LEVELS[obstacle] - 1.0,
+    "payload": float(payload),
+    "target_runtime_min": float(target_runtime_min),
+    "control": control,
+    "air_drag": bool(air_drag),
 }
 
-st.markdown(
-    f"""
-    <div class="info-box">
-    <b>가상환경 설명</b><br>
-    노면: {road} — {ROAD_PROFILES[road]['desc']}<br>
-    제어 방식: {control_mode} — {CONTROL_MODES[control_mode]['desc']}
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+st.header("4. 가상 주행 시뮬레이션 결과")
+if st.button("🚗 가상 주행 시뮬레이션 실행", type="primary", use_container_width=True):
+    st.session_state["last_result"] = simulate(spec, env)
+    st.session_state["last_spec"] = spec
+    st.session_state["last_env"] = env
 
-# -----------------------------
-# 시뮬레이션 실행
-# -----------------------------
-st.divider()
-if st.button("🚀 가상 주행 시뮬레이션 실행", use_container_width=True):
-    st.session_state.sim = run_simulation(design, env)
-    st.session_state.env = env
-
-if "sim" not in st.session_state:
-    st.info("가상환경 조건을 설정한 뒤 [가상 주행 시뮬레이션 실행] 버튼을 누르세요.")
+if "last_result" not in st.session_state:
+    st.info("입력 방식을 선택하고 설계 데이터를 적용한 뒤, 가상 주행 시뮬레이션을 실행하세요. 붙여넣기 없이 직접 입력만으로도 사용할 수 있습니다.")
     st.stop()
 
-sim = st.session_state.sim
-env = st.session_state.env
-
-# -----------------------------
-# 결과 대시보드
-# -----------------------------
-st.divider()
-st.subheader("4. 핵심 성능 예측 결과")
+result = st.session_state["last_result"]
+spec = st.session_state["last_spec"]
+env = st.session_state["last_env"]
 
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("종합 점수", f"{sim['total_score']:.1f} / 100")
-m2.metric("예상 최고속도", f"{sim['vmax_mps']:.2f} m/s")
-m3.metric("토크 여유율", f"{sim['torque_margin']:.1f} %")
-m4.metric("예상 주행시간", f"{sim['runtime_min']:.1f} 분")
+m1.metric("종합 점수", f"{result['score']:.1f} / 100")
+m2.metric("예상 최고 속도", f"{result['predicted_max_speed']:.2f} m/s")
+m3.metric("토크 여유율", f"{result['torque_margin']:.1f}%")
+m4.metric("예상 주행 가능 시간", f"{result['runtime_h']*60:.1f}분")
 
-m5, m6, m7, m8 = st.columns(4)
-m5.metric("최대 등판 가능각", f"{sim['max_grade_deg']:.1f} °")
-m6.metric("가속 시간", "불가" if sim['accel_time'] == float('inf') else f"{sim['accel_time']:.1f} s")
-m7.metric("발열 위험도", sim["heat_level"])
-m8.metric("예상 제동거리", f"{sim['braking_distance']:.2f} m")
+st.subheader("PASS / WARNING / FAIL 판정 기준 및 근거")
+for item in result["judgements"]:
+    color = status_color(item["판정"])
+    st.markdown(
+        f"""
+<div style='border-left:8px solid {color}; padding:12px 16px; margin:10px 0; background:rgba(128,128,128,0.08); border-radius:8px;'>
+<b>{item['항목']}</b> &nbsp; <span style='color:{color}; font-weight:800;'>{item['판정']}</span><br>
+<b>결과값:</b> {item['결과값']}<br>
+<b>판정 기준:</b> {item['판정 기준']}<br>
+<b>근거:</b> {item['근거']}
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+    if item["판정"] != "PASS":
+        st.warning(f"주 원인 분석: {item['주 원인']}")
+        st.info(f"해결방안: {item['해결방안']}")
 
-# -----------------------------
-# PASS / WARNING / FAIL 판정 기준 및 근거
-# -----------------------------
-st.subheader("5. PASS / WARNING / FAIL 판정 및 근거")
-st.caption("각 판정은 입력된 가상환경 조건에서의 상대적 예측입니다. 실제 제작 시 부품 효율, 노면 상태, 센서 오차 등에 따라 달라질 수 있습니다.")
-
-status_box(
-    sim["statuses"]["속도"],
-    "목표 속도 달성",
-    f"목표 대비 {sim['speed_achievement']:.1f}% 달성, 예상 최고속도 {sim['vmax_mps']:.2f} m/s",
-    "PASS ≥ 목표속도의 95%, WARNING 75~95%, FAIL < 75%",
-    f"모터 RPM {design['motor_rpm']:.0f}, 기어비 {design['gear_ratio']:.1f}:1, 바퀴 반지름 {design['wheel_radius']:.2f} m를 이용해 휠 회전 속도를 계산했습니다.",
-)
-status_box(
-    sim["statuses"]["토크"],
-    "토크 여유",
-    f"토크 여유율 {sim['torque_margin']:.1f}%, 사용 가능 바퀴토크 {sim['wheel_torque_each']:.2f} Nm / 요구 {sim['required_wheel_torque_each']:.2f} Nm",
-    "PASS ≥ 30% 여유, WARNING 0~30%, FAIL < 0%",
-    f"경사, 노면 구름저항, 장애물 수준을 반영한 요구 견인력을 바퀴당 요구 토크로 환산했습니다.",
-)
-status_box(
-    sim["statuses"]["등판"],
-    "등판 성능",
-    f"설정 경사 {env['grade_deg']:.1f}°, 최대 가능 {sim['max_grade_deg']:.1f}°",
-    "PASS = 설정 경사보다 3° 이상 여유, WARNING = 통과 가능하지만 여유 3° 미만, FAIL = 설정 경사 초과",
-    f"접지 한계와 사용 가능 견인력에서 구름저항을 제외한 값을 이용해 최대 등판각을 추정했습니다.",
-)
-status_box(
-    sim["statuses"]["배터리"],
-    "배터리 지속성",
-    f"예상 {sim['runtime_min']:.1f}분 / 목표 {env['target_time_min']:.1f}분, 예상 주행거리 {sim['range_m']:.1f} m",
-    "PASS ≥ 목표시간 100%, WARNING 70~100%, FAIL < 70%",
-    f"평균 소비전력 {sim['avg_power']:.1f} W와 배터리 용량 {design['battery_wh']:.1f} Wh를 이용했습니다.",
-)
-status_box(
-    sim["statuses"]["발열"],
-    "발열 위험",
-    f"부하율 {sim['load_ratio']:.1f}%, 위험도 {sim['heat_level']}",
-    "PASS = 낮음/주의, WARNING = 높음, FAIL = 위험",
-    f"모터 토크와 RPM으로 근사 정격출력을 계산하고 평균 소비전력과 비교했습니다.",
-)
-status_box(
-    sim["statuses"]["제동"],
-    "제동 안정성",
-    f"제동거리 {sim['braking_distance']:.2f} m / 기준 {sim['safe_braking_limit']:.2f} m",
-    "PASS = 기준보다 0.5 m 이상 짧음, WARNING = 기준 이내이나 여유 0.5 m 미만, FAIL = 기준 초과",
-    f"노면 마찰계수와 목표 속도를 이용해 단순 제동거리를 추정했습니다.",
-)
-
-# -----------------------------
-# 원인 분석 및 해결방안
-# -----------------------------
-problems = analyze_causes_and_solutions(design, env, sim)
-st.subheader("6. PASS가 아닌 항목의 주 원인 분석 및 해결방안")
-if problems:
-    for p in problems:
-        st.markdown(f"**{p['항목']}**")
-        st.write(f"- 주 원인: {p['주 원인']}")
-        st.write(f"- 해결방안: {p['해결방안']}")
-else:
-    st.success("현재 조건에서는 모든 핵심 판정이 PASS입니다. 실제 제작 전에는 부품 실제 효율, 배터리 전압 강하, 센서 지연 등을 추가 검증하는 것이 좋습니다.")
-
-# -----------------------------
-# 3D 가상 주행 이미지
-# -----------------------------
-st.subheader("7. 3D Virtual Driving Scene")
-st.caption("이미지 제목과 축 설명은 글자 깨짐을 줄이기 위해 영어로 표시됩니다. 아래에 주요 용어를 한국어로 풀어 설명합니다.")
-draw_3d_scene(design, env, sim)
-
-with st.expander("3D 이미지 주요 용어 한국어 설명", expanded=True):
-    st.write(
+st.subheader("3D Virtual Driving Scene")
+st.caption("English labels are used inside the image to avoid font rendering issues.")
+st.pyplot(draw_3d_scene(spec, env, result))
+with st.expander("이미지 주요 용어 한글 설명", expanded=True):
+    st.markdown(
         """
-        - **Motion Direction**: 모빌리티가 진행하는 방향입니다.
-        - **Course Direction**: 가상 코스의 길이 방향입니다.
-        - **Vehicle Width**: 모빌리티의 좌우 폭 방향입니다.
-        - **Height**: 지면으로부터의 높이 방향입니다.
-        - **Road**: 선택한 노면 조건입니다.
-        - **Grade**: 경사각입니다. 값이 클수록 등판에 필요한 토크가 증가합니다.
-        - **Speed achievement**: 목표 속도 대비 예상 최고속도의 달성률입니다.
-        """
+- **Course**: 주행 코스 방향입니다.
+- **Width**: 노면의 좌우 폭입니다.
+- **Height**: 지면 또는 구조물의 높이입니다.
+- **Driving Direction**: 모빌리티가 진행하는 방향입니다.
+- **Obstacle**: 설정된 장애물 수준이 반영된 가상 장애물입니다.
+- **Speed**: 현재 조건에서 계산된 예상 최고 속도입니다.
+- **Slope**: 사용자가 설정한 경사각입니다.
+- **Road**: 사용자가 선택한 노면 조건입니다.
+"""
     )
 
-# -----------------------------
-# 그래프
-# -----------------------------
-st.subheader("8. 시간 기반 성능 그래프")
-draw_graphs(sim)
+st.subheader("성능 그래프")
+st.pyplot(draw_graphs(result))
 
-with st.expander("그래프 용어 설명", expanded=False):
-    st.write(
-        """
-        - **Speed Profile**: 시간에 따른 속도 변화입니다.
-        - **Distance Profile**: 시간에 따른 누적 이동 거리입니다.
-        - **Battery Remaining**: 시간에 따른 배터리 잔량 추정값입니다.
-        - **Torque Usage**: 사용 가능 토크 대비 요구 토크의 비율입니다. 100%를 넘으면 토크 부족 위험이 커집니다.
-        """
-    )
+st.subheader("시뮬레이션 로그")
+logs = [
+    f"[00.0s] 가상 주행 시작: {spec['purpose']}",
+    f"[환경] 노면={env['road']}, 경사={env['slope_deg']:.1f}°, 장애물={env['obstacle']}, 코스={env['course_m']:.1f}m",
+    f"[구동계] 모터토크={spec['motor_torque']:.2f}Nm, 모터RPM={spec['motor_rpm']:.0f}, 기어비={spec['gear_ratio']:.1f}:1, 바퀴반지름={spec['wheel_radius']:.2f}m",
+    f"[계산] 사용 가능 견인력={result['usable_force']:.1f}N, 필요 견인력={result['required_force']:.1f}N",
+    f"[결과] 최고속도={result['predicted_max_speed']:.2f}m/s, 토크여유율={result['torque_margin']:.1f}%, 발열지수={result['heat_index']:.1f}",
+]
+for line in logs:
+    st.text(line)
 
-# -----------------------------
-# 보고서용 해석문
-# -----------------------------
-st.subheader("9. 보고서용 해석 문장")
-report_text = make_report_text(design, env, sim, problems)
-st.text_area("자동 생성 해석문", value=report_text, height=260)
+st.subheader("보고서용 해석문")
+report = make_report(spec, env, result)
+st.text_area("자동 생성 해석문", report, height=180)
 
-# -----------------------------
-# 결과 내보내기
-# -----------------------------
-st.subheader("10. 테스트베드 결과 저장/복사")
-result_payload = {
-    "program": "virtual_mobility_testbed",
-    "created_at": datetime.now().isoformat(timespec="seconds"),
-    "design": design,
+st.subheader("발전 방향 및 피드백")
+st.markdown(
+    """
+### 향후 발전 방향
+1. 실제 모터의 토크-속도 곡선과 효율맵을 반영하면 최고속도와 발열 예측 정확도를 높일 수 있습니다.
+2. 배터리 전압 강하, BMS 제한, 드라이버 전류 제한을 추가하면 고부하 상황을 더 현실적으로 분석할 수 있습니다.
+3. 장애물 통과 모델, 서스펜션, 무게중심, 전복 위험도까지 포함하면 테스트베드의 검증 범위가 넓어집니다.
+4. 초기 설계 도움 시스템에서 JSON을 표준 형식으로 내보내면 붙여넣기 정확도가 더 높아집니다.
+"""
+)
+feedback = st.text_area("이 시뮬레이터에 추가적으로 원하는 기능이 있다면 개발자에게 알려주세요.", height=100, placeholder="예: 센서 시뮬레이션, 카메라/LiDAR 표시, 실제 부품 DB 연동, 코스 편집 기능 등")
+if st.button("피드백 임시 저장"):
+    st.success("피드백이 화면 세션에 임시 저장되었습니다. 실제 제출 기능은 추후 서버/DB 연동으로 확장할 수 있습니다.")
+
+export = {
+    "spec": spec,
     "environment": env,
-    "simulation_summary": {
-        "score": round(sim["total_score"], 2),
-        "statuses": sim["statuses"],
-        "vmax_mps": round(sim["vmax_mps"], 3),
-        "torque_margin_percent": round(sim["torque_margin"], 2),
-        "runtime_min": round(sim["runtime_min"], 2),
-        "max_grade_deg": round(sim["max_grade_deg"], 2),
-        "heat_level": sim["heat_level"],
-        "braking_distance_m": round(sim["braking_distance"], 3),
-    },
-    "problems_and_solutions": problems,
-    "report_text": report_text,
+    "result_summary": {k: v for k, v in result.items() if k not in ["time", "speed_series", "distance_series", "battery_series", "torque_use_series", "judgements"]},
+    "judgements": result["judgements"],
+    "report": report,
 }
 st.download_button(
-    "💾 테스트베드 결과 JSON 다운로드",
-    data=json.dumps(result_payload, ensure_ascii=False, indent=2),
+    "⬇️ 테스트베드 결과 JSON 다운로드",
+    data=json.dumps(export, ensure_ascii=False, indent=2),
     file_name="virtual_mobility_testbed_result.json",
     mime="application/json",
     use_container_width=True,
 )
-
-# -----------------------------
-# 발전 방향 및 피드백
-# -----------------------------
-st.divider()
-st.subheader("11. 발전 방향 및 피드백")
-
-st.markdown(
-    """
-    **향후 발전 방향**
-    1. 실제 모터의 토크-RPM 곡선과 배터리 전압 강하를 반영하면 예측 정확도를 높일 수 있습니다.
-    2. 바퀴형, 궤도형, 스쿠터형, 자동차형 등 외형별 물리 모델을 더 세분화할 수 있습니다.
-    3. 장애물 통과, 급정지, 코너링, 미끄러짐 같은 동작을 별도 시나리오로 추가할 수 있습니다.
-    4. 초기 설계 도움 시스템과 동일한 데이터 포맷을 유지하면 두 프로그램을 하나의 설계-검증 흐름으로 연결할 수 있습니다.
-    5. 실제 제작 후 측정값을 입력해 시뮬레이션 결과와 비교하면 보정 계수를 만들 수 있습니다.
-    """
-)
-
-feedback = st.text_area(
-    "이 시뮬레이터에 추가적으로 원하는 기능이 있다면 개발자에게 알려주세요.",
-    placeholder="예: 코너링 안정성 추가, 실제 모터 DB 연동, 3D 이미지 더 구체화, 장애물 통과 애니메이션 등",
-    height=120,
-)
-if st.button("📨 피드백 임시 저장", use_container_width=True):
-    if feedback.strip():
-        st.success("피드백이 입력되었습니다. Streamlit Cloud에서는 별도 DB가 없으면 서버에 영구 저장되지는 않으므로, 필요한 경우 내용을 복사해 개발자에게 전달하세요.")
-    else:
-        st.warning("피드백 내용을 입력한 뒤 버튼을 눌러주세요.")
-
-st.caption("주의: 본 테스트베드는 교육·탐구 목적의 성능 예측 도구이며, 실제 제작 안전성 검증을 완전히 대체하지 않습니다.")
 
